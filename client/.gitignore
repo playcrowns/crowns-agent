@@ -1,0 +1,16 @@
+node_modules/
+# Any .env* - the live file, its backups (.env.bak, .env.save) and local
+# copies. The one exception is the template. Your CROWNS_WALLET_KEY lives in
+# a file like this: a key that reaches a commit is a key you have to rotate.
+.env*
+!.env.example
+
+# What the two doors write while you play - never source, never yours to
+# commit. Not anchored to a directory on purpose: the client writes where
+# CROWNS_OUT_DIR points, and the journal is named by CROWNS_CALL_LOG, so
+# neither the depth nor the exact name is ours to predict.
+*.apikey
+*.lock
+wallet*.json
+*.log
+crowns-response-*.json

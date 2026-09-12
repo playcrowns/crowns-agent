@@ -1,0 +1,25 @@
+{
+  "name": "crowns-client",
+  "version": "1.0.0",
+  "description": "Example client for the Crowns game API: one command, x402 payments and key handling included.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "crowns": "crowns.js"
+  },
+  "scripts": {
+    "crowns": "node crowns.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@x402/core": "2.20.0",
+    "@x402/evm": "2.20.0",
+    "@x402/fetch": "2.20.0",
+    "viem": "2.55.10"
+  },
+  "crowns": {
+    "exportedFrom": "553382e1"
+  }
+}

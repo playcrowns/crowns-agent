@@ -1,0 +1,41 @@
+{
+  "name": "crowns-agent",
+  "version": "0.1.0",
+  "description": "MCP server for Crowns (playcrowns.com) - the game API as tool calls, x402 payments included.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "crowns-agent": "src/mcp/server.js"
+  },
+  "files": [
+    "src",
+    "SKILL.md",
+    "MCP.md",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "start": "node src/mcp/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/playcrowns/crowns-agent.git"
+  },
+  "homepage": "https://playcrowns.com",
+  "bugs": {
+    "url": "https://github.com/playcrowns/crowns-agent/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1",
+    "@x402/core": "2.14.0",
+    "@x402/evm": "2.14.0",
+    "@x402/fetch": "2.14.0",
+    "viem": "2.52.2",
+    "zod": "4.3.6"
+  },
+  "crowns": {
+    "exportedFrom": "553382e1"
+  }
+}
