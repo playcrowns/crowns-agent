@@ -58,6 +58,7 @@ export const LOCAL_REFUSAL_STATUS = -1
 
 export const PAY_ENTRY_PATH = '/api/v1/accounts/pay-entry'
 export const RECOVER_KEY_PATH = '/api/v1/accounts/recover-key'
+export const REDEEM_TICKET_PATH = '/api/v1/accounts/redeem-ticket'
 
 /**
  * The game API lives under /api/v1 - bare paths get the prefix, so that
@@ -128,17 +129,50 @@ async function send(io, req) {
 // check a foreign or tampered server could ask for a signature over anything
 // at all.
 const RECOVERY_PREFIX = 'Crowns key recovery:'
+// The ticket string is its own protocol: a signature captured for one must
+// never work in the other, so the prefix is checked separately.
+const TICKET_PREFIX = 'Crowns ticket entry:'
 
-function refuseToSign(message) {
+function refuseToSign(message, prefix = RECOVERY_PREFIX) {
   return {
     status: LOCAL_REFUSAL_STATUS,
     json: {
       error: 'this client refused to sign what the server asked for',
       asked_to_sign: String(message).slice(0, 200),
-      hint: `a key-recovery message must start with "${RECOVERY_PREFIX}" and name your own wallet. Nothing was signed.`,
+      hint: `the message must start with "${prefix}" and name your own wallet. Nothing was signed.`,
     },
     headers: {},
   }
+}
+
+/**
+ * Entering on a TICKET won at an earlier tournament: no payment at all,
+ * the wallet signature is the whole proof. Two steps, exactly like
+ * recovery - the server names the string, because it is bound to this
+ * tournament and to the Terms version the seat accepts.
+ */
+async function redeemTicket(io, body) {
+  const probe = await send(io, {
+    paid: false, method: 'POST', path: REDEEM_TICKET_PATH,
+    body: { wallet_address: io.walletAddress },
+  })
+  const message = probe.json?.sign_exactly
+  // No string named: no valid ticket, closed registration, a 429. The
+  // answer carries the reason in words - hand it back as it is.
+  if (typeof message !== 'string' || !message) return probe
+  const wallet = String(io.walletAddress || '').toLowerCase()
+  if (!message.startsWith(TICKET_PREFIX) || (wallet && !message.toLowerCase().includes(wallet))) {
+    return refuseToSign(message, TICKET_PREFIX)
+  }
+  const signature = await io.signMessage(message)
+  const res = await send(io, {
+    paid: false, method: 'POST', path: REDEEM_TICKET_PATH,
+    body: { ...(body && typeof body === 'object' ? body : {}), wallet_address: io.walletAddress, signature },
+  })
+  // The key file may still hold last tournament's key - overwrite it.
+  if (typeof res.json?.api_key === 'string') io.saveKey(res.json.api_key)
+  res.proved = true
+  return res
 }
 
 /** The recovery probe: `proved` means a wallet signature really did go out. */
@@ -278,6 +312,7 @@ export async function performCall({ method, path, body, io }) {
   const p = apiPath(path)
   const req = { paid: true, method: String(method).toUpperCase(), path: p, body }
   if (p === PAY_ENTRY_PATH) return await joinTheGame({ io, ...req })
+  if (p === REDEEM_TICKET_PATH) return await redeemTicket(io, body)
   return await callOrdinary(io, req)
 }
 

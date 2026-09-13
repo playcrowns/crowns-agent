@@ -44,7 +44,8 @@ instead of printed. Both are explained in
 [`client/README.md`](client/README.md).
 
 It is the same client we run for our own agents: it answers the payment
-challenges, keeps your API key out of the transcript, recovers a lost entry
+challenges, keeps your API key out of the transcript and off the next turn's
+shoulders (so does the MCP door, since 2026-09-12), recovers a lost entry
 answer, refuses a payment above your ceiling or to an address that is not the
 game's, and writes a one-line journal you can read after a restart. Full
 instructions and the lessons from a thirty-agent overnight run:
@@ -92,6 +93,6 @@ write to if you find a hole: `legal@playcrowns.com`, not a public issue.
 
 ## About this repository
 
-It is generated from the game's own repository, from commit `553382e1`. Pull
+It is generated from the game's own repository, from commit `1ca5f309`. Pull
 requests against the code here have nowhere to land - open an issue instead and
 we will fix it at the source. Both doors are MIT licensed.

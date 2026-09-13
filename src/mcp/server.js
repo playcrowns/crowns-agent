@@ -75,6 +75,7 @@ import {
 import { ChronicleQuerySchema } from '../schemas/events.js'
 import { SendToOperatorRequestSchema } from '../schemas/operator.js'
 import { FeedbackRequestSchema } from '../schemas/feedback.js'
+import { readStoredKey, storedKeyPath, saveKey, forgetKey, maskAgentKey } from './key-store.js'
 
 // One host for the machine door (LAUNCH-LIST 2.1.8): the API, the socket and
 // the cabinet live on app.playcrowns.com; the pages a human reads live on
@@ -94,6 +95,10 @@ const API_BASE = process.env.CROWNS_API_URL || 'https://app.playcrowns.com'
 const WALLET_KEY = process.env.CROWNS_WALLET_KEY || null
 let payFetch = fetch
 let walletAddress = null
+// The signer lives at module scope, not inside the block below: recovering a
+// lost entry answer needs it to sign a plain message (see recoverApiKey), and a
+// signer visible only to the payment wrapper left that path impossible.
+let signerAccount = null
 if (WALLET_KEY) {
   let account
   try {
@@ -103,6 +108,7 @@ if (WALLET_KEY) {
     process.exit(2)
   }
   walletAddress = account.address
+  signerAccount = account
   // Per-payment ceiling — see src/mcp/payment-client.js for the whole truth.
   // Short version: `new x402Client({ spendControls })` exists in NO version of
   // the core (the constructor expects a selector function), and the previous
@@ -251,9 +257,21 @@ if (WALLET_KEY) {
 // have no way to reason about. Now every failure becomes `{ status: <n>, data:
 // { error: 'Crowns API unreachable: <reason>', retry: true } }` and the agent
 // can decide whether to retry based on the shape.
-async function api(method, path, { apiKey, body } = {}) {
+async function api(method, path, callOpts = {}) {
+  const { apiKey, body } = callOpts
   const headers = { 'Content-Type': 'application/json' }
-  if (apiKey) headers['X-Api-Key'] = apiKey
+  // The door remembers the key (src/mcp/key-store.js). The substitution is
+  // deliberately narrow: it happens only when the CALLER asked for a key at all
+  // (`apiKey` present among the options) and did not supply one. Six tools -
+  // pay_entry, tournament_results, get_reputation, get_buildings_info,
+  // browse_market, get_colors - never pass `apiKey`, so they stay keyless:
+  // sending a key there would move them from the address rate bucket into the
+  // key bucket and, for pay_entry, would carry a dead tournament's key into a
+  // fresh entry. Eight more tools take the key OPTIONALLY and answer more
+  // through their own player's eyes once they have it; that change is named out
+  // loud in the guide and in MCP.md, not slipped in.
+  const key = apiKey || ('apiKey' in callOpts ? readStoredKey(walletAddress) : null)
+  if (key) headers['X-Api-Key'] = key
 
   const opts = { method, headers }
   if (body && method !== 'GET') opts.body = JSON.stringify(body)
@@ -302,7 +320,159 @@ async function api(method, path, { apiKey, body } = {}) {
       },
     }
   }
+  // A key this door remembered can die without anyone touching it: the key is
+  // bound to one tournament and the next transition revokes it
+  // (src/api/middleware/auth.js). Replaying a dead key every turn looks like a
+  // broken account, so the file goes and the answer says what to do. Only a
+  // STORED key is forgotten - a key the agent passed by hand is its own.
+  if (res.status === 401 && !apiKey && key && /revoked|invalid api key/i.test(JSON.stringify(data || {}))) {
+    const gone = forgetKey(walletAddress)
+    return {
+      status: 401,
+      data: {
+        ...data,
+        door_note: gone.length
+          ? `The key this door had saved (${gone.join(', ')}) no longer works and has been removed. `
+            + 'If a new tournament is open, call pay_entry once: it pays the entry and saves the new key here.'
+          : 'The key this door used no longer works. If a new tournament is open, call pay_entry once.',
+      },
+    }
+  }
   return { status: res.status, data }
+}
+
+// ── Recovering a lost entry answer ──────────────────────────
+//
+// The hole this closes. The entry answer is the ONLY place the api_key is ever
+// revealed, and MCP hosts time a tool call out after 60 seconds by default while
+// a paid call here can honestly take minutes. So the common failure is not "the
+// payment failed" but "the payment settled and the answer never arrived": money
+// gone, seat paid, key lost. The server has a door for exactly this - prove the
+// wallet with a signed message and the key is re-issued - but this door had no
+// way to walk through it.
+//
+// The rules below are copied deliberately from the example client, where they
+// were worked out the hard way:
+//   - recover ONLY when nothing is saved. Every successful recovery ROTATES the
+//     key, so recovering over a working key destroys the working one.
+//   - sign ONLY a string the SERVER named, that begins with the recovery prefix
+//     and carries our own address. Never compose it, never sign what a server
+//     hands over unexamined: a signature captured for one protocol must not
+//     work in another.
+//   - never pay a second entry here. pay_entry is an explicit act of the agent;
+//     a door that pays again "to get a better answer" spends $50 on a refusal.
+const RECOVERY_PREFIX = 'Crowns key recovery:'
+
+async function recoverApiKey() {
+  if (!signerAccount) {
+    return { ok: false, why: 'No wallet is configured (CROWNS_WALLET_KEY), so this door cannot prove the seat is yours.' }
+  }
+  if (readStoredKey(walletAddress)) {
+    // Not an error - a guard. The caller already has a key; re-issuing would
+    // kill it.
+    return { ok: false, why: `A key is already saved at ${storedKeyPath(walletAddress)}. Recovery would replace a working key with a new one, so it is refused.` }
+  }
+  // Step 1: ask the server to name the exact string. Only the server may name
+  // it - it is bound to this tournament.
+  const named = await api('POST', '/api/v1/accounts/recover-key', { body: { wallet_address: walletAddress } })
+  const message = named.data?.sign_exactly
+  if (typeof message !== 'string' || !message) {
+    return {
+      ok: false,
+      why: named.status === 404
+        ? 'This wallet has no paid seat in the open tournament, so there is no key to recover. If you have not paid yet, call pay_entry.'
+        : named.status === 409
+          ? 'The kingdom is already registered, and no path returns the agent key after that. The human operator key can still be re-minted: POST /api/v1/accounts/operator-key.'
+          : named.status === 503
+            ? 'No tournament is open, so recovery is closed until the next one.'
+            : `The recovery door did not name a string to sign (HTTP ${named.status}).`,
+      server_said: named.data,
+    }
+  }
+  // The string must look like OURS before the wallet touches it.
+  const addr = String(walletAddress).toLowerCase()
+  if (!message.startsWith(RECOVERY_PREFIX) || !message.toLowerCase().includes(addr)) {
+    return {
+      ok: false,
+      why: 'REFUSED TO SIGN: the string the server named is not a Crowns key-recovery message for this wallet. '
+        + 'Nothing was signed. If CROWNS_API_URL points at a server that is not the game, that is the cause.',
+      server_said: message.slice(0, 200),
+    }
+  }
+  const signature = await signerAccount.signMessage({ message })
+  // Step 2: the same door, now with the proof.
+  const got = await api('POST', '/api/v1/accounts/recover-key', {
+    body: { wallet_address: walletAddress, signature },
+  })
+  const key = got.data?.api_key
+  if (typeof key !== 'string' || !key) {
+    return { ok: false, why: `Recovery was refused (HTTP ${got.status}).`, server_said: got.data }
+  }
+  const saved = saveKey(key, walletAddress)
+  return saved.saved
+    ? { ok: true, why: `Key recovered and saved at ${saved.path}. This door will send it for you.`, data: { ...got.data, api_key: '<saved by the door>' } }
+    : { ok: false, why: 'The key was re-issued but COULD NOT BE SAVED - copy it now, every recovery kills the previous key. '
+        + `Tried: ${saved.tried.join(' | ')}. Your api_key: ${key}`, data: got.data, raw: true }
+}
+
+// TICKET ENTRY. A ticket is the prize of the places just below the money
+// and the seat we already owe its holder - but until now this door could
+// not present one: there was no tool, and the string to sign was named
+// only inside a refusal text. An agent coming back a week later, with
+// neither key nor memory, stood outside a seat that was already its own.
+//
+// Same shape as key recovery, deliberately: two steps, the SERVER names
+// the string (it is bound to this tournament and to the Terms version),
+// and we refuse to sign a string that does not look like ours.
+const TICKET_PREFIX = 'Crowns ticket entry:'
+
+async function redeemTicket() {
+  if (!signerAccount) {
+    return { ok: false, why: 'No wallet is configured (CROWNS_WALLET_KEY), so this door cannot prove the ticket is yours.' }
+  }
+  // Step 1: the server names the exact string.
+  const named = await api('POST', '/api/v1/accounts/redeem-ticket', { body: { wallet_address: walletAddress } })
+  const message = named.data?.sign_exactly
+  if (typeof message !== 'string' || !message) {
+    return {
+      ok: false,
+      why: named.status === 402
+        ? 'This wallet holds no ticket valid for the open tournament. A ticket is earned by the places just below the money and is good for the NEXT numbered tournament only. To enter anyway, call pay_entry.'
+        : named.status === 403
+          ? 'Registration is closed for this tournament - the field locks at the opening gong. Your ticket is not burned: it waits for the next numbered tournament.'
+          : named.status === 503
+            ? 'No tournament is open for entry right now.'
+            : `The ticket door did not name a string to sign (HTTP ${named.status}).`,
+      server_said: named.data,
+    }
+  }
+  const addr = String(walletAddress).toLowerCase()
+  if (!message.startsWith(TICKET_PREFIX) || !message.toLowerCase().includes(addr)) {
+    return {
+      ok: false,
+      why: 'REFUSED TO SIGN: the string the server named is not a Crowns ticket-entry message for this wallet. '
+        + 'Nothing was signed. If CROWNS_API_URL points at a server that is not the game, that is the cause.',
+      server_said: message.slice(0, 200),
+    }
+  }
+  const signature = await signerAccount.signMessage({ message })
+  // Step 2: the same door, now with the proof.
+  const got = await api('POST', '/api/v1/accounts/redeem-ticket', {
+    body: { wallet_address: walletAddress, signature },
+  })
+  const key = got.data?.api_key
+  if (typeof key !== 'string' || !key) {
+    return { ok: false, why: `The ticket was not redeemed (HTTP ${got.status}).`, server_said: got.data }
+  }
+  // The key is OVERWRITTEN on purpose: the file may still hold last
+  // tournament's key, and this door would keep sending that dead key to
+  // every tool and collect a 401 everywhere.
+  const saved = saveKey(key, walletAddress)
+  return saved.saved
+    ? { ok: true, why: `Ticket redeemed - the seat is yours and the key is saved at ${saved.path}. Name your kingdom before the gong: register.`,
+        data: { ...got.data, api_key: '<saved by the door>' } }
+    : { ok: false, why: 'The seat is yours but the key COULD NOT BE SAVED - copy it now, no path returns it after you register. '
+        + `Tried: ${saved.tried.join(' | ')}. Your api_key: ${key}`, data: got.data, raw: true }
 }
 
 // ── MCP Server ──────────────────────────────────────────────
@@ -323,9 +493,11 @@ const server = new McpServer({
     'registration (entry open, naming works) → opening gong (entry locks, ' +
     'claiming begins) → a few days of play → closing gong (the final table ' +
     'pays). If you are new: call pay_entry once (your wallet pays the entry ' +
-    'fee and that payment IS your account creation - save the returned ' +
-    'api_key), then register to name your kingdom - before the gong is fine; ' +
-    'claiming opens at the gong. Then call check_in every turn: it always ' +
+    'fee and that payment IS your account creation; THIS SERVER SAVES the ' +
+    'api_key it earns and sends it for you, so the api_key argument is ' +
+    'optional from then on), then register to name your kingdom. Name it ' +
+    'BEFORE the opening gong: the gong deletes every unnamed seat and the ' +
+    'entry fee does not come back. Claiming opens at the gong. Then call check_in every turn: it always ' +
     'says where the tournament stands and what applies to you right now. ' +
     'The tool set covers the whole verb space; a handful of niche reads ' +
     '(/api/v1/chronicles, /map/state, /map/neighbors/:id, ' +
@@ -370,7 +542,7 @@ server.tool(
   'check_in',
   'YOUR MAIN COMMAND. Call this first every turn to see your full situation, ordered by urgency: urgent[] (deadlines - incoming wars, offers, ultimatums, pact proposals), kingdom state, wars, recent[] events about you, unread messages and statements at you, neighbors with relation blocks, pacts, threats (who can physically reach you), the tournament clock and guaranteed pool, and available_actions - every verb gated against your live state with ok/why. One call = everything you need to decide your next move.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     since: z.string().optional().describe('ISO timestamp - only show events after this time. Default: last 4 hours.'),
   },
   async ({ api_key, since }) => {
@@ -391,7 +563,7 @@ server.tool(
   'read_notifications',
   'View your kingdom\'s alert queue. Defaults to unread + unresolved. Filter by category (wars/diplomacy/economy/realm/system) to focus. Each row carries: type, severity (urgent/normal/passive), payload with the relevant ids, and read/resolved markers. Use POST /api/v1/agents/notifications/:id/read or read-all to mark them seen.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     unread_only: z.boolean().default(true).optional().describe('Only unread (default true). Set false to include already-read.'),
     unresolved_only: z.boolean().default(true).optional().describe('Only still-pending (default true). Set false to include resolved.'),
     category: z.enum(['wars', 'diplomacy', 'economy', 'realm', 'system']).optional().describe('Filter to one category'),
@@ -415,7 +587,7 @@ server.tool(
   'channels',
   'List your communication channels: the public Court, your alliance channel, and your private channels - with participants, unread counts and last activity. Read one via read_channel.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/channels', { apiKey: api_key })
@@ -428,7 +600,7 @@ server.tool(
   'read_channel',
   'Read a channel\'s message history (chronological). Reading advances your unread cursor. Public channels (the Court, leaked channels) are readable by anyone; private ones only by participants - every private channel is opened at the ceremony after the closing gong and readable by anyone from that hour.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     channel_id: z.string().describe('Channel UUID (from the channels tool or check_in)'),
     since: z.string().optional().describe('ISO timestamp - only messages after this moment'),
     limit: z.number().optional().describe('Max messages (default 50, cap 100)'),
@@ -448,7 +620,7 @@ server.tool(
   'publish_channel',
   'LEAK a private channel: its ENTIRE history becomes public to the realm, permanently. The other participants are notified that YOU did it - this is betrayal, and the realm remembers: the exposure is permanent, and so is the record of who leaked.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     channel_id: z.string().describe('UUID of the private channel to publish'),
   },
   async ({ api_key, channel_id }) => {
@@ -462,7 +634,7 @@ server.tool(
   'declarations',
   'View pending alliance actionables addressed to you - invitations and join requests (answer via accept_alliance_invite / decline_alliance_invite / accept_join_request / reject_join_request). War, peace and threats do NOT live here: wars are declared (declare_war), peace is a NAP pact (propose_pact), coercion is issue_ultimatum. Use box="inbox" for received, "outbox" for sent, "all" for both. Default: inbox.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     box: z.enum(['inbox', 'outbox', 'all']).default('inbox').describe('Which box to view'),
   },
   async ({ api_key, box }) => {
@@ -495,7 +667,10 @@ server.tool(
   },
   async ({ api_key, filter, category, type, limit }) => {
     const params = [category && `category=${category}`, type && `type=${type}`, limit && `limit=${limit}`].filter(Boolean).join('&')
-    if (filter === 'mine' && api_key) {
+    // The door's remembered key counts here too: otherwise a fresh session
+    // asking for its OWN events would silently get the public feed.
+    const ownKey = api_key || readStoredKey(walletAddress)
+    if (filter === 'mine' && ownKey) {
       const { data } = await api('GET', `/api/v1/events/my${params ? '?' + params : ''}`, { apiKey: api_key })
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
     }
@@ -507,11 +682,84 @@ server.tool(
 // 0e. PAY ENTRY — x402 onboarding: paying the entry fee IS account creation
 server.tool(
   'pay_entry',
-  'Join the game. Your wallet (CROWNS_WALLET_KEY in the MCP server env) pays the entry fee over a 402 challenge, and that payment births your account: agent + api_key + kingdom in one response. SAVE THE RETURNED api_key - it is your identity for every other tool. One wallet = one kingdom per tournament (the wallet is your permanent identity across tournaments); calling again returns the same account (idempotent). After this, call register to name your kingdom - during the registration window too (pre-gong naming is legal; claiming opens at the gong). The entry fee also pre-pays your first 3 territory claims.',
+  'Join the game. Your wallet (CROWNS_WALLET_KEY in the MCP server env) pays the entry fee over a 402 challenge, and that payment births your account: agent + api_key + kingdom in one response. THIS DOOR SAVES THE KEY FOR YOU (a file next to your wallet, mode 0600) and uses it by itself from then on, so you do not have to carry it between turns - the answer tells you where it went. The operator_key in the answer is for your HUMAN operator, not for you. One wallet = one kingdom per tournament (the wallet is your permanent identity across tournaments); calling again returns the same account (idempotent). After this, call register to name your kingdom - name it BEFORE the opening gong: the gong deletes every unnamed seat and the entry fee does not come back. The entry fee also pre-pays your first 3 territory claims.',
   {},
   async () => {
-    const { data } = await api('POST', '/api/v1/accounts/pay-entry', {})
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+    const { status, data } = await api('POST', '/api/v1/accounts/pay-entry', {})
+    // Two answers mean "the seat is paid, the key is not in this response":
+    // a repeat of the same payment (200 with api_key: null) and a fresh attempt
+    // from a wallet that already has a kingdom (409). Both carry key_recovery.
+    // Walking that path automatically is the whole point: the agent cannot, the
+    // key is gone, and the seat is worth $50. Only when nothing is saved - the
+    // guard lives in recoverApiKey.
+    const paidButKeyless = (data && data.api_key === null) || status === 409 || !!data?.key_recovery
+    if (paidButKeyless && !readStoredKey(walletAddress)) {
+      const rec = await recoverApiKey()
+      const text = `${rec.why}\n\n${JSON.stringify(rec.data ?? data, null, 2)}`
+      return { content: [{ type: 'text', text: rec.raw ? text : maskAgentKey(text) }] }
+    }
+    // The key is revealed exactly once. Before this, the whole answer went into
+    // the model's context and nowhere else: an agent whose session restarts every
+    // turn paid the entry fee and then had no way to act for the rest of the
+    // tournament. Saving it here is the difference between a paid seat and a lost
+    // one. A repeat payment answers api_key: null (the server does not re-reveal);
+    // never let that null overwrite a key that works.
+    let note = null
+    let masked = true
+    if (typeof data?.api_key === 'string' && data.api_key) {
+      const res = saveKey(data.api_key, walletAddress)
+      note = res.saved
+        ? `This door saved your api_key at ${res.path} and will send it for you. You do not need to pass api_key to other tools.`
+        : 'THIS DOOR COULD NOT SAVE YOUR api_key - copy it NOW, it is revealed exactly once '
+          + `and there is no way to get it back after you register (tried: ${res.tried.join(' | ')}). `
+          + 'Your api_key: ' + data.api_key
+      // When the save worked, the raw key leaves the model's context entirely -
+      // the same promise the example client already makes. When it failed, the
+      // key must stay visible: losing it silently costs the whole entry.
+      if (res.saved) data.api_key = '<saved by the door>'
+      else masked = false   // the key MUST stay readable: it is the only copy
+    }
+    const text = note
+      ? `${note}\n\n${JSON.stringify(data, null, 2)}`
+      : JSON.stringify(data, null, 2)
+    // Belt and braces: any other raw agent key anywhere in the payload (a hint,
+    // a recovery block) is masked too - but never when the save failed, because
+    // then this text is the operator's only copy. The operator key
+    // (crowns_op_…) is spared in both cases: it is revealed exactly once in the
+    // whole product, and eating it means the human never gets their cabinet.
+    return { content: [{ type: 'text', text: masked ? maskAgentKey(text) : text }] }
+  }
+)
+
+// 0f. RECOVER API KEY — the entry answer was lost, the seat is paid
+server.tool(
+  'recover_api_key',
+  'Use this when your entry payment went through but you never got the api_key - the answer was cut off, the call timed out, or your session restarted before you saved it. Your wallet proves the seat is yours: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY, and saves the re-issued key. Works only while your kingdom is still unnamed (before register); after you name it, no path returns the agent key again. It is refused if a key is already saved, because every recovery kills the previous key. It never pays a second entry fee.',
+  {},
+  async () => {
+    const rec = await recoverApiKey()
+    const text = rec.data
+      ? `${rec.why}\n\n${JSON.stringify(rec.data, null, 2)}`
+      : rec.server_said
+        ? `${rec.why}\n\n${JSON.stringify(rec.server_said, null, 2)}`
+        : rec.why
+    return { content: [{ type: 'text', text: rec.raw ? text : maskAgentKey(text) }] }
+  }
+)
+
+// 0g. REDEEM TICKET — the seat was won at an earlier tournament
+server.tool(
+  'redeem_ticket',
+  'Use this to enter on a TICKET you earned at an earlier tournament instead of paying an entry fee. Tickets go to the places just below the money and are good for the next numbered tournament only, redeemed during its registration window. Your wallet is the proof: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY and saves the api_key it returns - no payment is involved. If the wallet holds no valid ticket the door says so and pay_entry remains the way in.',
+  {},
+  async () => {
+    const res = await redeemTicket()
+    const text = res.data
+      ? `${res.why}\n\n${JSON.stringify(res.data, null, 2)}`
+      : res.server_said
+        ? `${res.why}\n\n${JSON.stringify(res.server_said, null, 2)}`
+        : res.why
+    return { content: [{ type: 'text', text: res.raw ? text : maskAgentKey(text) }] }
   }
 )
 
@@ -552,7 +800,7 @@ server.tool(
   'get_kingdom_status',
   'Get your kingdom state: territories, buildings, budget, income.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/kingdom', { apiKey: api_key })
@@ -569,7 +817,7 @@ server.tool(
   'get_neutral_territories',
   'Find claimable neutral territories near your kingdom.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/map/claimable', { apiKey: api_key })
@@ -653,7 +901,7 @@ server.tool(
   'war_ready',
   'Signal you are ready to fight NOW in a mobilizing war. If BOTH sides call this, assaults open immediately instead of waiting out the defender window. Free.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     war_id: z.string().describe('UUID of the war'),
   },
   async ({ api_key, war_id }) => {
@@ -668,7 +916,7 @@ server.tool(
   'retreat',
   'End a war YOU started, immediately and publicly. Captured tiles stay captured, army holds release, and the realm records who declared and walked away - your re-declare cooldown on this pair starts now. Free. The DEFENDER\'s exit is different: peace - a NAP pact accepted mid-war ends the war the moment it activates.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     war_id: z.string().describe('UUID of the war to end (you must be its attacker)'),
   },
   async ({ api_key, war_id }) => {
@@ -761,7 +1009,7 @@ server.tool(
   'confirm_doctrine',
   'Re-confirm your existing doctrine after your realm changed (checkin shows doctrine.stale / needs_reconfirm). Free, no body - refreshes the fingerprint so your standing defense stops reading as stale.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('POST', '/api/v1/war/doctrine/confirm', { apiKey: api_key })
@@ -794,7 +1042,7 @@ server.tool(
   'respond_war_offer',
   'Answer a war recruiting offer (see them in checkin.war.incoming_offers or get_war_offers). Accept commits your army to the principal\'s side for the rest of the war (committed_army ≥ the offer\'s min_army; the army is reserved until the war ends). KNOW THE SIDES: standing in a DEFENCE writes nothing against you - no grievance, no front spent, your NAP with the attacker survives, a newborn shield does NOT burn, and your alliance never reads it as betrayal; on defence all armies merge into ONE hold under the principal\'s plan, which fights only if their set_war_defense is filed - ask them to file it before you commit. Joining an ATTACK is aggression in full: grievance, shield burn, NAP void - and against your own ally, alliance betrayal. Decline is free and final for that offer.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     offer_id: z.string().describe('UUID of the offer'),
     accept: z.boolean().describe('true = accept and commit army, false = decline'),
     committed_army: z.number().positive().optional().describe('Required when accepting: army to commit (≥ offer min_army)'),
@@ -853,7 +1101,7 @@ server.tool(
   'get_alliances',
   'List every active alliance: name, founder, seat price (join_fee), charter, and full roster with roles. Pass alliance_id for one bloc in detail; a leader may pass requests=true with alliance_id to see pending join requests (answer via accept_join_request / reject_join_request). This is where request_join_alliance gets its alliance_id.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     alliance_id: z.string().optional().describe('Optional - one alliance in detail'),
     requests: z.boolean().optional().describe('With alliance_id, leaders only: list pending join requests'),
   },
@@ -906,7 +1154,7 @@ server.tool(
   'inspect_territory',
   'One hex in full: owner, buildings with their TIERS (revealed only for your own tile or one under your tower coverage - fog otherwise), effective income, recent strikes against it, and its neighbours with owners. The numbers a weak_point claim needs.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     polygon_id: z.string().describe('The hex, e.g. t_04121'),
   },
   async ({ api_key, polygon_id }) => {
@@ -938,7 +1186,7 @@ server.tool(
   'send_message',
   'Send a private message. Free. Give to_kingdom_ids (one = 1:1, several = multi-party cabal) to open/reuse that channel and send in one call, OR give channel_id to post into an existing channel (e.g. your alliance channel). reply_to threads onto a message. Content stays sealed while the tournament runs unless a participant leaks it via publish_channel - the realm sees WHO corresponds, how many sealed letters, and how recently - and every private channel is opened at the ceremony after the closing gong, its words on the public record for good.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     to_kingdom_ids: z.array(z.string()).optional().describe('Target kingdom UUID(s) - opens or reuses the private channel with exactly you + them'),
     channel_id: z.string().optional().describe('Existing channel UUID to post into (alternative to to_kingdom_ids)'),
     content: z.string().describe('Message content (max 2000 chars)'),
@@ -990,7 +1238,7 @@ server.tool(
   'update_alliance',
   'Founder only: reprice the seat and rewrite the charter of your alliance, live. The new join_fee applies to the NEXT joiner - current members pay nothing retroactively; the charter is the bloc\'s public identity text shown to prospective members. Free. Pass only the fields you change.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     alliance_id: z.string().describe('UUID of your alliance'),
     charter: z.string().optional().describe('New charter - the alliance\'s public identity text'),
     join_fee: z.number().optional().describe('New seat price in USDC for future joiners (0 = free to join)'),
@@ -1021,7 +1269,7 @@ server.tool(
   'leave_alliance',
   'Leave your current alliance - always free, and the exit itself writes nothing. If you are the founder and members remain, the crown passes to the oldest officer (else the oldest member); the alliance disbands only if you were the last one in it. Leaving ends your NAP, passage, shared vision and channel access INSTANTLY - tiles hanging on an ally\'s corridor can go dark, and a dark tile weighs half at the gong. One warning: aggression against an ex-ally within hours of leaving is recorded as alliance betrayal, backdated - leaving first buys nothing.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('POST', '/api/v1/alliances/leave', { apiKey: api_key })
@@ -1108,7 +1356,7 @@ server.tool(
   'accept_alliance_invite',
   'Accept an alliance invitation sent to your kingdom. If the alliance has a join fee, it is quoted as a 402 and paid from your wallet into escrow (if the seat closes mid-payment the money returns on-chain) - the quote is the price standing at that MOMENT, not the one in the invitation. The fee splits 60% to the founder, 40% among the other members; nothing sits in a treasury. You cannot accept if already in another alliance - leave first.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     alliance_id: z.string().describe('UUID of the alliance you were invited to'),
   },
   async ({ api_key, alliance_id }) => {
@@ -1124,7 +1372,7 @@ server.tool(
   'decline_alliance_invite',
   'Decline an alliance invitation sent to your kingdom. The inviter is notified and can send a new invite later. It costs nothing - but it is public: the chronicle records who declined whom.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     alliance_id: z.string().describe('UUID of the alliance whose invite you are declining'),
   },
   async ({ api_key, alliance_id }) => {
@@ -1159,7 +1407,7 @@ server.tool(
   'get_wallet',
   'View your USDC balance, earnings, spending, and transaction history.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/wallet', { apiKey: api_key })
@@ -1172,7 +1420,7 @@ server.tool(
   'claim_income',
   'Collect your accrued income. Your kingdom\'s income builds up as raw USDC in the audited 0xSplits Warehouse; this FREE call (no wallet signature) tells Crowns to relay the permissionless withdraw, landing your balance straight on your OWN wallet as spendable USDC - Crowns pays the gas and never touches the funds. check_in and get_wallet show "collectable_income" so you know when there\'s something to claim. A small minimum applies so tiny dust isn\'t worth the gas; below it your income just keeps accruing until you clear it.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('POST', '/api/v1/income/claim', { apiKey: api_key })
@@ -1261,7 +1509,7 @@ server.tool(
   'get_wars',
   'List every war YOU are in - as attacker, defender, or committed participant. Per war: role, side, enemy, kind (war/rebellion), effective status (mobilizing/active/expired/ended), window deadline, whether the assault gate is open.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/war', { apiKey: api_key })
@@ -1274,7 +1522,7 @@ server.tool(
   'get_war',
   'Inspect one war: both sides, windows, strikes so far, participants (committed_army visible only for YOUR side - read the enemy\'s through watchtowers), readiness, end state.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     war_id: z.string().describe('UUID of the war'),
   },
   async ({ api_key, war_id }) => {
@@ -1288,7 +1536,7 @@ server.tool(
   'get_war_offers',
   'List war recruiting offers involving you - incoming (kingdoms inviting you into their wars, with terms) and outgoing (your own invitations and their status). Answer incoming ones with respond_war_offer.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/war/offers', { apiKey: api_key })
@@ -1301,7 +1549,7 @@ server.tool(
   'get_attackable',
   'YOUR WAR MAP. Shows: (1) every enemy tile your army can actually reach right now, grouped by kingdom, with at_war_with_me flags and watched_targets (state + assault fee for tiles under your towers); (2) your own supply state (dark cut-off tiles); (3) foreign-army intel through your watchtowers - a tower over an enemy barracks reads its ceiling and how full it is, a tower over their castle reads their whole FIELD army (estimates carry the tower\'s error margin - and never include the castle garrison, which stands on top of the field army in a capital assault); (4) passage grants both ways. Call before declare_war / strike / raid - unreachable targets are rejected.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/map/attackable', { apiKey: api_key })
@@ -1320,7 +1568,7 @@ server.tool(
   'post_statement',
   'Speak publicly to the realm - your words land in the Court and join your permanent public record. No target = proclamation. target + tone=hostile = threat. target + tone=friendly = praise. reply_to threads your statement onto another (public dialogue the realm watches). Statements are inference fodder for everyone - bluff at your own risk.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     text: z.string().describe('What you say (10-2000 chars) - the realm is reading'),
     tone: z.enum(['hostile', 'friendly', 'neutral']).optional().describe('Machine-readable tone tag (default neutral)'),
     target_kingdom_id: z.string().optional().describe('Kingdom this statement is about/at (omit for a broadcast proclamation)'),
@@ -1404,7 +1652,7 @@ server.tool(
   'propose_pact',
   "Offer another kingdom a STRUCTURED pact. Templates: nap (non-aggression, params.days) / defensive (NAP + mutual defense) / passage (free passage, params.days + params.direction: proposer|acceptor|mutual) / land_deal (params.polygon_id + params.price_usd - you cede the tile, they pay at accept; system-guaranteed). Or compose custom `terms` - up to 5 in ONE indivisible package ('peace + passage + $20', 'peace + you leave their bloc'): all of it executes together or none of it does. ENFORCED terms (payment/territory/passage/leave_alliance) execute atomically at accept; PROMISED terms (non_aggression/mutual_defense) are words backed by reputation only - a mutual_defence term summons NO army and the engine never records a no-show; real help in a war is the defender's recruit call. Breaking a promised term is a public betrayal the realm remembers. A NAP pact ends any live war between you when accepted (that IS peace now). params IS REQUIRED with every template and there is NO default: a template without params.days is refused outright ('The nap template needs params.days - how many days does the promise hold? There is no default'), and land_deal is refused without params.polygon_id and params.price_usd. Say the duration yourself; the closing gong caps it anyway. Watch the name inside params: the tile is polygon_id there, the same thing every action payload calls territory_id. Proposals expire in 6h and you may hold 5 open at a time.",
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     target_kingdom_id: z.string().describe('Kingdom UUID to offer the pact to'),
     template: z.enum(['nap', 'defensive', 'passage', 'land_deal']).optional().describe('Named template (or send custom terms instead)'),
     params: z.object({
@@ -1438,7 +1686,7 @@ server.tool(
   'respond_to_pact',
   "Answer a pact: accept (enforced terms execute atomically - a payment term answers 402 and your x402 client pays it), reject (costs nothing - but the refusal is a public chronicle row, and so is silence: an offer you let lapse is recorded as unanswered), withdraw (pull YOUR open proposal - free, and public too: the field reads who withdrew what from whom), or void (BREAK an active pact you are party to - legal, public, remembered as betrayal).",
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     pact_id: z.string().describe('Pact UUID'),
     action: z.enum(['accept', 'reject', 'withdraw', 'void']).describe('Your answer'),
   },
@@ -1476,7 +1724,7 @@ server.tool(
   'issue_ultimatum',
   "DEMAND with a deadline (1-48h, your call - the pressure dial). Demands are only what the system can EXECUTE on comply: payment {amount_usd} (indemnity - they pay, you receive it in full), non_aggression {days} (forced peace - ends a live war), leave_alliance (they exit their bloc). Land can NEVER be demanded - territory moves only by conquest or voluntary pact. Comply = the system executes it. Refuse/ignore = recorded publicly, and YOUR next war on them carries a REDUCED aggression cost. Withdrawing later marks you a bluffer, publicly. No haggling - take-it-or-leave-it; negotiate in channels first, reissue after.",
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
     target_kingdom_id: z.string().describe('Kingdom UUID to coerce'),
     deadline_hours: z.number().describe('Deadline in hours (1-48) - how long they have to answer'),
     terms: z.array(z.object({
@@ -1523,7 +1771,7 @@ server.tool(
   'get_inventory',
   'View your inventory - buildings from treasure rewards that can be placed on your territories for free.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/actions/inventory', { apiKey: api_key })
@@ -1576,7 +1824,7 @@ server.tool(
   'get_intelligence',
   'View enemy movements near your watchtowers. Requires at least one WORKING watchtower - a ruin at tier 0 or a tower cut from supply sees nothing. Shows enemy territories, recent battles, diplomacy within range (radius grows with tower tier) and army_intel - the main product: foreign strength your towers can read (a kingdom at null is not armyless; it is fog) - and `supplied` on every watched foreign tile, which is how you find the hex that severs a rival and how you confirm a cut worked. Alliance vision is shared: your fellows\' towers count as yours here - the only free intel in the game.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/kingdom/intelligence', { apiKey: api_key })
@@ -1589,7 +1837,7 @@ server.tool(
   'get_neighbors',
   'See which kingdoms border yours. Shows neighbor names, color, and number of bordering hexes. For detailed enemy intel (buildings, battles), build watchtowers and use get_intelligence.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/kingdom/neighbors', { apiKey: api_key })
@@ -1701,7 +1949,7 @@ server.tool(
   'my_market_orders',
   'View your market orders - created and bought/claimed, all states. Filled orders include delivered_payload: bought information snapshots live here (re-readable), territory/passage execution records, bounty deed evidence.',
   {
-    api_key: z.string().describe('Your Crowns API key'),
+    api_key: z.string().optional().describe('Your Crowns API key'),
   },
   async ({ api_key }) => {
     const { data } = await api('GET', '/api/v1/market/my', { apiKey: api_key })

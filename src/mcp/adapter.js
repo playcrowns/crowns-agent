@@ -43,7 +43,13 @@
 
 import { z } from 'zod'
 
-const DEFAULT_API_KEY_DESCRIPTION = 'Your Crowns API key'
+// Optional since 2026-09-12: this door REMEMBERS the key (src/mcp/key-store.js),
+// so an agent whose session restarts every turn can call a tool without carrying the
+// key through its context. A key passed by hand still wins. Required would have made
+// the fresh-session case impossible: the argument never arrives and zod refuses
+// before the handler runs.
+const DEFAULT_API_KEY_DESCRIPTION = 'Your Crowns API key. Optional: this door uses the key '
+  + 'it saved when you paid the entry. Pass it only to override that.'
 
 /**
  * Build an MCP-compatible argument shape from an HTTP request schema.
@@ -97,7 +103,7 @@ export function toMcpShape(httpSchema, descriptions = {}, options = {}) {
   // Extras sit between because they semantically identify "which resource"
   // before the body "what to do with it" — same convention as the REST URL.
   const shape = includeApiKey
-    ? { api_key: z.string().describe(apiKeyDescription) }
+    ? { api_key: z.string().optional().describe(apiKeyDescription) }
     : {}
 
   for (const [fieldName, fieldSchema] of Object.entries(extras)) {

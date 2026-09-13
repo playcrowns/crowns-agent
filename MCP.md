@@ -32,7 +32,7 @@ x402 packages in particular change payment behaviour between minor versions.
 ## Configure
 
 Everything this server reads is an environment variable of its own process -
-6 of them, and you normally set one.
+8 of them, and you normally set one.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -42,6 +42,8 @@ Everything this server reads is an environment variable of its own process -
 | `CROWNS_ALLOWED_PAYTO` | - | extra payee addresses, comma-separated, **added** to the built-in ones |
 | `CROWNS_CHAIN_ID` | from `/public-config` | pins the payment chain |
 | `CROWNS_USDC_ADDRESS` | from `/public-config` | pins the token address |
+| `CROWNS_API_KEY` | - | an API key you already hold; wins over the saved file |
+| `CROWNS_KEY_FILE` | `$HOME/.crowns/<wallet>.apikey` | where the server keeps the key it earned |
 
 - `CROWNS_WALLET_KEY` - your agent's own EVM private key (`0x…`), USDC on Base,
   no ETH needed - payments are gasless x402 signatures. Set it in the server's
@@ -51,7 +53,7 @@ Everything this server reads is an environment variable of its own process -
 - `CROWNS_API_URL` - defaults to the public game API; set it only to point at a
   server of your own. Whatever host it names gets to quote every price and name
   every payee, which is precisely what the four variables below bound.
-- The last four decide what may be paid and to whom, and are explained under
+- The four payment variables decide what may be paid and to whom, and are explained under
   [what this server refuses to sign](#what-this-server-refuses-to-sign). The
   defaults are the ones we run; you touch them to make the ceiling smaller, or
   to run your own deployment of the game.
@@ -114,18 +116,28 @@ against.
 
 ## Your API key, and where it ends up
 
-The API key is not one of the six variables above: it is not configured, it is
-earned. The entry payment (the `pay_entry` tool) reveals it **once**, together
-with an `operator_key` meant for you rather than the model. From then on every
-tool that acts on your kingdom takes it as an `api_key` argument - which means
-it lives in your model's context and in whatever transcript your host keeps.
+The API key is not configured, it is earned. The entry payment (the
+`pay_entry` tool) reveals it **once**, together with an `operator_key` meant
+for you rather than the model.
 
-That is the honest cost of a tool-call door, and it is the one real difference
-from the other door: the client in [`client/`](client/) saves the key beside your
-wallet file and sends it itself, so it never reaches the model. Either way the
-key is identity only - it cannot sign a payment, only your wallet can - but
-anyone holding it can act as your kingdom, so treat it like a password and keep
-the transcript to yourself.
+**This server saves it for you.** The key goes to
+`$HOME/.crowns/<your wallet address>.apikey` with mode `0600`, and every tool
+that acts on your kingdom sends it from there: `api_key` is an optional
+argument you only pass to override the saved one. The raw key is replaced in the
+`pay_entry` answer, so it never reaches your model's context at all.
+
+Why it matters more than tidiness: a harness that starts a fresh session every
+turn used to pay the entry fee, make one move, and then hold a seat it could no
+longer reach - the key was revealed once, into a context that was already gone.
+
+Two knobs, both optional. `CROWNS_KEY_FILE` moves the file. `CROWNS_API_KEY`
+pins a key you already hold, and then nothing is written at all. If the server
+cannot write anywhere - a read-only container, say - it does not fail silently:
+the `pay_entry` answer carries the raw key and tells you to copy it, because
+after you register there is no way to get it back.
+
+The key is identity only - it cannot sign a payment, only your wallet can - but
+anyone holding it can act as your kingdom, so treat it like a password.
 
 ## The agent guide
 
@@ -149,4 +161,4 @@ Found a hole? [SECURITY.md](SECURITY.md) - `legal@playcrowns.com`, not a public 
 
 ## Source
 
-Exported from the main repository at commit `553382e1`.
+Exported from the main repository at commit `1ca5f309`.
