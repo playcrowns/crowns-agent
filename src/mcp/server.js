@@ -75,7 +75,11 @@ import {
 import { ChronicleQuerySchema } from '../schemas/events.js'
 import { SendToOperatorRequestSchema } from '../schemas/operator.js'
 import { FeedbackRequestSchema } from '../schemas/feedback.js'
-import { readStoredKey, storedKeyPath, saveKey, forgetKey, maskAgentKey } from './key-store.js'
+import {
+  readStoredKey, storedKeyPath, saveKey, forgetKey, maskAgentKey,
+  saveOperatorKey, storedOperatorKeyPath, readStoredOperatorKeyEntries, forgetOperatorKeyFile,
+  readLegacyCwdKey, forgetLegacyCwdKey,
+} from './key-store.js'
 
 // One host for the machine door (LAUNCH-LIST 2.1.8): the API, the socket and
 // the cabinet live on app.playcrowns.com; the pages a human reads live on
@@ -183,7 +187,7 @@ if (WALLET_KEY) {
     client.register(`eip155:${chainId}`, new ExactEvmScheme(account))
     schemeReady = true
   }
-  const wrappedFetch = wrapFetchWithPayment(fetch, client)
+  const wrappedFetch = wrapFetchWithPayment(markPaymentSigned(fetch), client)
   payFetch = async (...args) => {
     // The payee check never got installed: nobody would verify who the money
     // goes to, so nothing may be signed. The work is done below, out of this
@@ -257,7 +261,97 @@ if (WALLET_KEY) {
 // have no way to reason about. Now every failure becomes `{ status: <n>, data:
 // { error: 'Crowns API unreachable: <reason>', retry: true } }` and the agent
 // can decide whether to retry based on the shape.
+//
+// Except after a SIGNED payment (review of wave 1 recheck, 13.09, C9). A paid
+// move can wait in the operator wallet's queue longer than nginx holds the
+// request, and the model then read `retry: true` on an HTML 504: it called
+// build again, the first build had landed meanwhile, the second call quoted
+// the next tier and paid for it - one intent, two charges (a bounty: two
+// escrows). A request that carried a payment signature is marked on the way
+// out, and a lost answer to it says "do not repeat - read your check-in".
+
+/** Mark a response or error that answered a request carrying a payment signature. */
+function markPaymentSigned(impl) {
+  return async (input, init) => {
+    const signed = typeof input?.headers?.has === 'function'
+      && (input.headers.has('PAYMENT-SIGNATURE') || input.headers.has('X-PAYMENT'))
+    // The signature's own validBefore decides when a lost answer is final (round 3).
+    const validBefore = signed ? signedValidBefore(input.headers.get('PAYMENT-SIGNATURE') || input.headers.get('X-PAYMENT')) : null
+    try {
+      const res = await impl(input, init)
+      if (signed && res && typeof res === 'object') {
+        try { res.paymentSigned = true; res.paymentValidBefore = validBefore } catch { /* a frozen response stays unmarked */ }
+      }
+      return res
+    } catch (err) {
+      if (signed && err && typeof err === 'object') {
+        try { err.paymentSigned = true; err.paymentValidBefore = validBefore } catch { /* same */ }
+      }
+      throw err
+    }
+  }
+}
+
+/** validBefore (unix seconds) of the authorization inside a payment header, or null. */
+function signedValidBefore(header) {
+  try {
+    const v = Number(JSON.parse(Buffer.from(String(header), 'base64').toString('utf8'))?.payload?.authorization?.validBefore)
+    return Number.isFinite(v) && v > 0 ? v : null
+  } catch {
+    return null
+  }
+}
+
+// The server's own wait before an unknown outcome is read again
+// (src/lib/payment-ledger.js: RECONCILE_STALE_MS 120 s + RECONCILE_LOOP_MS 60 s).
+const LOST_PAID_ANSWER_WAIT_S = 180
+// When a lost paid answer is decided for good (review of wave 1 recheck, rounds
+// 2-3, 13.09, C9) - counted from the SIGNED authorization, the way the server
+// counts it: validBefore, plus the slack after which the ledger buries an unused
+// one (120 s), plus one reconciler pass (180 s). Round 2 counted 600 s from the
+// start of the call: the quote is signed after that start, and a quote with a
+// longer window (up to the 900 s this door signs) is decided minutes after the
+// door called it final. Without a readable signature the door assumes that
+// longest window. A unit test pins these against the server's config.
+const SETTLE_EXPIRY_SLACK_S = 120
+const LOST_PAID_ANSWER_FALLBACK_S = 900 + SETTLE_EXPIRY_SLACK_S + LOST_PAID_ANSWER_WAIT_S
+const ENTRY_PATH = '/api/v1/accounts/pay-entry'
+
+function lostPaidAnswer(error, { startedAt = Date.now(), path = '', validBefore = null } = {}) {
+  const finalMs = Number.isFinite(validBefore) && validBefore > 0
+    ? Math.max(Date.now(), validBefore * 1000 + SETTLE_EXPIRY_SLACK_S * 1000) + LOST_PAID_ANSWER_WAIT_S * 1000
+    : Math.max(Date.now(), startedAt + LOST_PAID_ANSWER_FALLBACK_S * 1000)
+  const outcomeFinalBy = new Date(finalMs).toISOString()
+  // Only the entry may be repeated after a wait: it refuses a second charge while
+  // its payment is open. Every other paid door quotes afresh and signs again.
+  if (path === ENTRY_PATH) {
+    return {
+      error,
+      retry: false,
+      payment_outcome: 'unknown',
+      sign_new_payment: false,
+      retry_after_seconds: LOST_PAID_ANSWER_WAIT_S,
+      outcome_final_by: outcomeFinalBy,
+      door_note: 'This entry had signed its payment when the answer was lost. Wait retry_after_seconds, then call pay_entry once more: it never charges twice.',
+    }
+  }
+  return {
+    error,
+    retry: false,
+    payment_outcome: 'unknown',
+    sign_new_payment: false,
+    outcome_final_by: outcomeFinalBy,
+    door_note: 'This call had signed a payment when its answer was lost, so the payment may have gone through and the move may already be yours. '
+      + 'Do NOT call this tool again before outcome_final_by - a new call signs a NEW payment. Read check_in in a few minutes: '
+      + 'a payment still being decided is listed under payments_in_flight, and a move missing from check_in before outcome_final_by is NOT proof it failed. '
+      + 'After outcome_final_by read check_in once more: a payment still listed there was charged and is being applied or refunded - do not repeat '
+      + '(one listed with will_not_apply: true never applies - its refund is already sent, and a new move is a new payment); '
+      + 'a move neither applied nor listed did not happen, and any money it took comes back to your wallet by itself.',
+  }
+}
+
 async function api(method, path, callOpts = {}) {
+  const startedAt = Date.now()
   const { apiKey, body } = callOpts
   const headers = { 'Content-Type': 'application/json' }
   // The door remembers the key (src/mcp/key-store.js). The substitution is
@@ -270,6 +364,8 @@ async function api(method, path, callOpts = {}) {
   // fresh entry. Eight more tools take the key OPTIONALLY and answer more
   // through their own player's eyes once they have it; that change is named out
   // loud in the guide and in MCP.md, not slipped in.
+  // An old wallet-less ./crowns.apikey is adopted only once the game names its wallet as ours.
+  const adoption = ('apiKey' in callOpts && !apiKey) ? await adoptLegacyCwdKey() : null
   const key = apiKey || ('apiKey' in callOpts ? readStoredKey(walletAddress) : null)
   if (key) headers['X-Api-Key'] = key
 
@@ -282,6 +378,9 @@ async function api(method, path, callOpts = {}) {
   } catch (err) {
     // Transport-level failures: TCP reset, DNS fail, timeout, refused connection.
     // fetch() rejects rather than returning a Response.
+    if (err?.paymentSigned) {
+      return { status: 503, data: lostPaidAnswer(`Crowns API unreachable after this call signed a payment: ${err.message}`, { startedAt, path, validBefore: err.paymentValidBefore }) }
+    }
     return {
       status: 503,
       data: { error: `Crowns API unreachable: ${err.message}`, retry: true },
@@ -296,6 +395,12 @@ async function api(method, path, callOpts = {}) {
     // page). Preserve the HTTP status so agents can distinguish between "API
     // rejected my request with a known status but unparseable body" and "API
     // is flat-out unreachable".
+    if (res.paymentSigned) {
+      return {
+        status: res.status || 502,
+        data: lostPaidAnswer(`Crowns API returned non-JSON body (${res.status}) after this call signed a payment: ${err.message}`, { startedAt, path, validBefore: res.paymentValidBefore }),
+      }
+    }
     return {
       status: res.status || 502,
       data: {
@@ -327,14 +432,36 @@ async function api(method, path, callOpts = {}) {
   // STORED key is forgotten - a key the agent passed by hand is its own.
   if (res.status === 401 && !apiKey && key && /revoked|invalid api key/i.test(JSON.stringify(data || {}))) {
     const gone = forgetKey(walletAddress)
+    // The human's file beside it is CHECKED, not dropped with the agent key:
+    // recovery rotates only the agent key, so a dead agent key can sit next
+    // to a live operator key. A transition kills both - and then the old
+    // copy must not wait here to be handed over as the human's key.
+    const op = await savedOperatorKeyState()
+    const opLine = op.state === 'dead'
+      ? ` The human's cabinet key saved beside it (${op.path}) no longer opens the cabinet either and has been removed; the next entry answer brings a fresh one.`
+      : ''
     return {
       status: 401,
       data: {
         ...data,
-        door_note: gone.length
+        door_note: (gone.length
           ? `The key this door had saved (${gone.join(', ')}) no longer works and has been removed. `
             + 'If a new tournament is open, call pay_entry once: it pays the entry and saves the new key here.'
-          : 'The key this door used no longer works. If a new tournament is open, call pay_entry once.',
+          : 'The key this door used no longer works. If a new tournament is open, call pay_entry once.')
+          + ' If this wallet already paid the entry of the open tournament, pay_entry does not charge again - it collects this seat\'s key.' + opLine,
+      },
+    }
+  }
+  // An old ./crowns.apikey the game could not be asked about yet: this call went
+  // out without it, and a bare "Missing X-Api-Key" must not read as "there is no
+  // key" (review of wave 1 recheck, round 3).
+  if (res.status === 401 && !key && adoption && adoption.settled === false) {
+    return {
+      status: 401,
+      data: {
+        ...data,
+        door_note: `A key file from an older door is on this machine (${adoption.path}), but the game could not be asked just now whether it belongs to this wallet `
+          + `(${adoption.status ? `HTTP ${adoption.status}` : 'no answer'}), so this call went out without a key. Nothing was charged. Call again in a minute; do not pay the entry again.`,
       },
     }
   }
@@ -363,15 +490,196 @@ async function api(method, path, callOpts = {}) {
 //     a door that pays again "to get a better answer" spends $50 on a refusal.
 const RECOVERY_PREFIX = 'Crowns key recovery:'
 
+// The human's key (13.09, C9 recon, operator cabinet). Every answer that
+// carries operator_key also leaves a copy in a file beside the agent key
+// (key-store.js), and the text says where - so the key outlives the one
+// answer it arrives in. The raw operator key is NOT masked for the model:
+// the agent is the courier to the human (ENTRY_NEXT tells it to hand the key
+// over), and a watching key re-minted by the wallet at any time is cheap to
+// replace if the transcript leaks. The agent key stays masked as before.
+const CABINET_URL = `${API_BASE.replace(/\/$/, '')}/map`
+
+function operatorKeyNote(operatorKey) {
+  if (typeof operatorKey !== 'string' || !operatorKey) return null
+  const op = saveOperatorKey(operatorKey, walletAddress)
+  return op.saved
+    ? `The operator_key in this answer is for your HUMAN operator: it opens their cabinet at ${CABINET_URL} - hand it to them. `
+      + `A copy is saved at ${op.path} (mode 0600) on this machine, so it does not depend on this conversation. `
+      + 'If they lose it, the kingdom\'s wallet re-mints it at any time (POST /api/v1/accounts/operator-key), and that kills every earlier copy.'
+    : `The operator_key in this answer is for your HUMAN operator: it opens their cabinet at ${CABINET_URL}. `
+      + `This door COULD NOT SAVE a copy of it (tried: ${op.tried.join(' | ')}), so this answer is the only one - hand it to them now. `
+      + 'If it is lost, the kingdom\'s wallet re-mints it (POST /api/v1/accounts/operator-key).'
+}
+
+/**
+ * Does the operator key file on this machine still open the cabinet?
+ *
+ * Review of wave 1b (13.09, C9 recon). A `.operatorkey` file outlives its
+ * tournament: the transition kills both keys of the pair, but only the agent
+ * file is dropped on the 401. Recovery then named the old copy to the model
+ * as "the human's key - hand it over", and the model had no way to tell a live
+ * copy from a dead one. One read-only GET with that key settles it: a 401 is
+ * the server's own word that the key is gone (an earlier tournament, or a
+ * newer mint), and only then is the file removed. No answer means "unknown",
+ * and the file stays.
+ *
+ * Review of wave 1 recheck (13.09, C9): every copy is checked on its own and
+ * only the refused one is removed (a dead copy under CROWNS_KEY_FILE used to
+ * take a live one in $HOME down with it), and a key that opens ANOTHER
+ * wallet's cabinet - `./crowns.operatorkey` in a shared working directory - is
+ * 'foreign', never 'alive'.
+ *
+ * @returns {Promise<{path: string|null, state: 'none'|'alive'|'dead'|'unknown'|'foreign'}>}
+ */
+async function savedOperatorKeyState() {
+  const path = storedOperatorKeyPath(walletAddress)
+  if (!path) return { path: null, state: 'none' }
+  const copies = readStoredOperatorKeyEntries(walletAddress)
+  if (!copies.length) return { path, state: 'unknown' }
+  let dead = null
+  let foreign = null
+  for (const copy of copies) {
+    // The operator key reads everything the agent reads; /wallet is one of the
+    // doors the cabinet itself opens with it. An explicit apiKey keeps api()
+    // from swapping in the stored agent key.
+    const probe = await api('GET', '/api/v1/wallet', { apiKey: copy.key })
+    if (keyRefusedByGame(probe)) {
+      forgetOperatorKeyFile(copy.path)
+      dead = dead || copy.path
+      continue
+    }
+    // A 401 that does not name the key (the pre-launch gate) says nothing about it.
+    if (probe.status === 401 || probe.status >= 500 || probe.status === 429 || !probe.status) return { path: copy.path, state: 'unknown' }
+    const owner = probe.data?.wallet_address
+    if (walletAddress && typeof owner === 'string' && owner.toLowerCase() !== String(walletAddress).toLowerCase()) {
+      foreign = foreign || copy.path
+      continue
+    }
+    return { path: copy.path, state: 'alive' }
+  }
+  return foreign ? { path: foreign, state: 'foreign' } : { path: dead, state: 'dead' }
+}
+
+// ── The saved agent key, judged by the game ─────────────────
+//
+// The working-directory file older doors wrote WITHOUT a wallet in its name
+// (./crowns.apikey). Review of wave 1 recheck, round 2 (13.09, C9): two agents
+// in one container with a read-only HOME share a working directory; B's entry
+// wrote B's key there, and A's door read it as its own - every tool of A played
+// B's kingdom, and A's recovery was refused over "a working key". New keys go
+// under the wallet's own name (key-store.js); the old file is adopted once, and
+// only when GET /api/v1/wallet names THIS wallet. Another wallet's key is never
+// sent and never deleted.
+/**
+ * The game refused the KEY itself - the same rule as the example client's
+ * keyRefused (review of wave 1 recheck, round 3). A 401 from the lock in front
+ * of the API (`pre_launch_gate`) carries no key code: reading it as "dead" wiped
+ * a working key of a named kingdom, which no path returns after register.
+ */
+function keyRefusedByGame(probe) {
+  if (probe?.status !== 401) return false
+  const code = probe.data?.code
+  if (code === 'KEY_UNKNOWN' || code === 'KEY_RETIRED' || code === 'KEY_RETIRED_CANCELLED') return true
+  return /invalid api key|api key revoked/i.test(String(probe.data?.error || ''))
+}
+
+let legacyAdoption = null
+
+function adoptLegacyCwdKey() {
+  if (!walletAddress) return Promise.resolve({ settled: true })
+  legacyAdoption ??= judgeLegacyCwdKey().then((verdict) => { if (!verdict.settled) legacyAdoption = null; return verdict })
+  return legacyAdoption
+}
+
+/** @returns {Promise<{settled: boolean, status?: number, path?: string}>} settled false when the game could not be asked - judged again later */
+async function judgeLegacyCwdKey() {
+  let legacy = null
+  try {
+    if (readStoredKey(walletAddress)) return { settled: true }
+    legacy = readLegacyCwdKey(walletAddress)
+    if (!legacy) return { settled: true }
+    const probe = await api('GET', '/api/v1/wallet', { apiKey: legacy.key })
+    const unasked = !probe.status || probe.status >= 500 || probe.status === 429 || (probe.status === 401 && !keyRefusedByGame(probe))
+    if (unasked) return { settled: false, status: probe.status, path: legacy.path }
+    const owner = probe.data?.wallet_address
+    if (probe.status >= 300 || typeof owner !== 'string' || owner.toLowerCase() !== String(walletAddress).toLowerCase()) {
+      process.stderr.write(`Crowns door: ${legacy.path} holds a key that is not this wallet's (HTTP ${probe.status}) - ignored, never sent\n`)
+      return { settled: true }
+    }
+    const saved = saveKey(legacy.key, walletAddress)
+    if (saved.saved && saved.path !== legacy.path) forgetLegacyCwdKey()
+    return { settled: true }
+  } catch {
+    return { settled: false, path: legacy?.path }
+  }
+}
+
+/**
+ * What the saved AGENT key is worth, in the game's own word (review of wave 1
+ * recheck, round 2): one free read, four answers. Before, only pay_entry asked,
+ * and recover_api_key refused over ANY file with "would replace a working key" -
+ * a key of an earlier tournament, or one the game simply could not be asked
+ * about during a 503, was named working, and the paid seat stayed unnamed.
+ *
+ * @returns {Promise<{ state: 'none'|'alive'|'dropped'|'pinned'|'unknown'|'foreign', note: string|null, status?: number, owner?: string }>}
+ */
+async function storedAgentKeyVerdict() {
+  const adoption = await adoptLegacyCwdKey()
+  const key = readStoredKey(walletAddress)
+  if (!key) {
+    // An old ./crowns.apikey still waiting for the game's word is not "no key"
+    // (round 3): recovery over it would rotate the key it may hold, and on a
+    // named kingdom answer "no path returns the key" while the key sits there.
+    if (adoption?.settled === false) return { state: 'unknown', note: null, status: adoption.status, legacyPath: adoption.path }
+    return { state: 'none', note: null }
+  }
+  const probe = await api('GET', '/api/v1/wallet', { apiKey: key })
+  if (keyRefusedByGame(probe)) {
+    if ((process.env.CROWNS_API_KEY || '').trim()) {
+      return { state: 'pinned', note: 'CROWNS_API_KEY in this server\'s environment holds a key the game refuses (a key of an earlier tournament, or one re-issued since). '
+        + 'This door cannot replace a pinned key: your operator must remove CROWNS_API_KEY and restart the server, then call pay_entry once more.' }
+    }
+    const gone = forgetKey(walletAddress)
+    return { state: 'dropped', note: `The key this door had saved (${gone.join(', ')}) is refused by the game - a key of an earlier tournament - and has been removed.` }
+  }
+  // Any other 401 (the pre-launch gate) did not judge the key: unknown, the file stays.
+  if (!probe.status || probe.status >= 500 || probe.status === 429 || probe.status === 401) return { state: 'unknown', note: null, status: probe.status }
+  const owner = probe.data?.wallet_address
+  if (walletAddress && typeof owner === 'string' && owner.toLowerCase() !== String(walletAddress).toLowerCase()) {
+    return { state: 'foreign', note: null, owner }
+  }
+  return { state: 'alive', note: null }
+}
+
+const NO_PAID_SEAT_WHY = 'This wallet has no paid seat in the open tournament, so there is no key to recover. If you have not paid yet, call pay_entry.'
+
 async function recoverApiKey() {
   if (!signerAccount) {
     return { ok: false, why: 'No wallet is configured (CROWNS_WALLET_KEY), so this door cannot prove the seat is yours.' }
   }
-  if (readStoredKey(walletAddress)) {
-    // Not an error - a guard. The caller already has a key; re-issuing would
-    // kill it.
-    return { ok: false, why: `A key is already saved at ${storedKeyPath(walletAddress)}. Recovery would replace a working key with a new one, so it is refused.` }
+  // Not an error - a guard: every recovery re-issues the key and kills the one
+  // before it. The game is asked first what the saved key is worth; only a key
+  // it accepts is called working (review of wave 1 recheck, round 2).
+  const saved = await storedAgentKeyVerdict()
+  const where = storedKeyPath(walletAddress)
+  if (saved.state === 'pinned') return { ok: false, why: saved.note }
+  if (saved.state === 'alive') {
+    return { ok: false, why: `A key is saved at ${where} and the game accepts it. Recovery would replace a working key with a new one, so it is refused.` }
   }
+  if (saved.state === 'unknown') {
+    const what = saved.legacyPath ? `A key file from an older door is on this machine (${saved.legacyPath})` : `A key is saved at ${where}`
+    return { ok: false, why: `${what}, but the game could not be asked just now whether it still works (${saved.status ? `HTTP ${saved.status}` : 'no answer'}). `
+      + 'Nothing was signed - call this again in a minute.' }
+  }
+  if (saved.state === 'foreign') {
+    return { ok: false, why: `The key saved at ${where} belongs to another wallet (${saved.owner}), not to ${walletAddress}. `
+      + 'This door neither uses it for recovery nor overwrites it: point CROWNS_KEY_FILE at a file of this wallet\'s own, then call this again.' }
+  }
+  const rec = await recoverWithSignature()
+  return saved.note ? { ...rec, why: `${saved.note}\n\n${rec.why}` } : rec
+}
+
+async function recoverWithSignature() {
   // Step 1: ask the server to name the exact string. Only the server may name
   // it - it is bound to this tournament.
   const named = await api('POST', '/api/v1/accounts/recover-key', { body: { wallet_address: walletAddress } })
@@ -380,7 +688,7 @@ async function recoverApiKey() {
     return {
       ok: false,
       why: named.status === 404
-        ? 'This wallet has no paid seat in the open tournament, so there is no key to recover. If you have not paid yet, call pay_entry.'
+        ? NO_PAID_SEAT_WHY
         : named.status === 409
           ? 'The kingdom is already registered, and no path returns the agent key after that. The human operator key can still be re-minted: POST /api/v1/accounts/operator-key.'
           : named.status === 503
@@ -406,11 +714,30 @@ async function recoverApiKey() {
   })
   const key = got.data?.api_key
   if (typeof key !== 'string' || !key) {
-    return { ok: false, why: `Recovery was refused (HTTP ${got.status}).`, server_said: got.data }
+    // The server answers 404 only to the SIGNED step: "no seat on this wallet".
+    return got.status === 404
+      ? { ok: false, noSeat: true, why: NO_PAID_SEAT_WHY, server_said: got.data }
+      : { ok: false, why: `Recovery was refused (HTTP ${got.status}).`, server_said: got.data }
   }
   const saved = saveKey(key, walletAddress)
+  // Recovery returns ONLY the agent key (13.09, C9 recon): the human's key
+  // was lost with the same entry answer, and not one word used to say so.
+  // Name whether a WORKING copy of it lies on this machine: a file is checked
+  // against the game before the model hears "hand it over" (review of wave
+  // 1b) - a copy from an earlier tournament used to be named as the live one.
+  const op = await savedOperatorKeyState()
+  const reMint = `Tell your human: they re-mint it with the kingdom's wallet at ${CABINET_URL} (SIGN IN, then LOST YOUR KEY) or through POST /api/v1/accounts/operator-key - without it they cannot open the cabinet.`
+  const opLine = op.state === 'alive'
+    ? ` Your human's cabinet key (operator_key) is not re-issued by recovery; the copy this door holds at ${op.path} still opens the cabinet - if the human does not have it yet, hand it over with the cabinet address ${CABINET_URL}.`
+    : op.state === 'dead'
+      ? ` Your human's cabinet key (operator_key) is not re-issued by recovery, and the copy this door held at ${op.path} no longer opens the cabinet (it was from an earlier tournament, or a newer key was minted since) - it has been removed. ${reMint}`
+      : op.state === 'unknown'
+        ? ` Your human's cabinet key (operator_key) is not re-issued by recovery. This door holds a copy at ${op.path}, but could not check it just now: a copy saved from this tournament's entry opens the cabinet at ${CABINET_URL}, one from an earlier tournament opens nothing. If it does not open, ${reMint.charAt(0).toLowerCase()}${reMint.slice(1)}`
+        : op.state === 'foreign'
+          ? ` Your human's cabinet key (operator_key) is not re-issued by recovery, and the copy at ${op.path} opens ANOTHER wallet's cabinet - it is not your human's key, do not pass it on. ${reMint}`
+          : ` Your human's cabinet key (operator_key) came in the same lost entry answer, and no copy of it is saved on this machine; recovery does not re-issue it. ${reMint}`
   return saved.saved
-    ? { ok: true, why: `Key recovered and saved at ${saved.path}. This door will send it for you.`, data: { ...got.data, api_key: '<saved by the door>' } }
+    ? { ok: true, why: `Key recovered and saved at ${saved.path}. This door will send it for you.${opLine}`, data: { ...got.data, api_key: '<saved by the door>' } }
     : { ok: false, why: 'The key was re-issued but COULD NOT BE SAVED - copy it now, every recovery kills the previous key. '
         + `Tried: ${saved.tried.join(' | ')}. Your api_key: ${key}`, data: got.data, raw: true }
 }
@@ -468,11 +795,14 @@ async function redeemTicket() {
   // tournament's key, and this door would keep sending that dead key to
   // every tool and collect a 401 everywhere.
   const saved = saveKey(key, walletAddress)
+  // A ticket entry hands out the pair too - the human's key goes beside the agent's.
+  const opNote = operatorKeyNote(got.data?.operator_key)
+  const opTail = opNote ? `\n\n${opNote}` : ''
   return saved.saved
-    ? { ok: true, why: `Ticket redeemed - the seat is yours and the key is saved at ${saved.path}. Name your kingdom before the gong: register.`,
+    ? { ok: true, why: `Ticket redeemed - the seat is yours and the key is saved at ${saved.path}. Name your kingdom before the gong: register.${opTail}`,
         data: { ...got.data, api_key: '<saved by the door>' } }
     : { ok: false, why: 'The seat is yours but the key COULD NOT BE SAVED - copy it now, no path returns it after you register. '
-        + `Tried: ${saved.tried.join(' | ')}. Your api_key: ${key}`, data: got.data, raw: true }
+        + `Tried: ${saved.tried.join(' | ')}. Your api_key: ${key}${opTail}`, data: got.data, raw: true }
 }
 
 // ── MCP Server ──────────────────────────────────────────────
@@ -682,10 +1012,30 @@ server.tool(
 // 0e. PAY ENTRY — x402 onboarding: paying the entry fee IS account creation
 server.tool(
   'pay_entry',
-  'Join the game. Your wallet (CROWNS_WALLET_KEY in the MCP server env) pays the entry fee over a 402 challenge, and that payment births your account: agent + api_key + kingdom in one response. THIS DOOR SAVES THE KEY FOR YOU (a file next to your wallet, mode 0600) and uses it by itself from then on, so you do not have to carry it between turns - the answer tells you where it went. The operator_key in the answer is for your HUMAN operator, not for you. One wallet = one kingdom per tournament (the wallet is your permanent identity across tournaments); calling again returns the same account (idempotent). After this, call register to name your kingdom - name it BEFORE the opening gong: the gong deletes every unnamed seat and the entry fee does not come back. The entry fee also pre-pays your first 3 territory claims.',
+  'Join the game. Your wallet (CROWNS_WALLET_KEY in the MCP server env) pays the entry fee over a 402 challenge, and that payment births your account: agent + api_key + kingdom in one response. THIS DOOR SAVES THE KEY FOR YOU (a file next to your wallet, mode 0600) and uses it by itself from then on, so you do not have to carry it between turns - the answer tells you where it went. The operator_key in the answer is for your HUMAN operator, not for you. One wallet = one kingdom per tournament (the wallet is your permanent identity across tournaments); calling again never charges twice: a paid seat answers with key recovery (this door walks it), a payment still settling answers wait - follow retry_after_seconds. After this, call register to name your kingdom - name it BEFORE the opening gong: the gong deletes every unnamed seat and the entry fee does not come back. The entry fee also pre-pays your first 3 territory claims.',
   {},
   async () => {
     const { status, data } = await api('POST', '/api/v1/accounts/pay-entry', {})
+    // The entry payment is still settling: its receipt did not come back in
+    // time, or an earlier entry of this wallet is still in flight. The server
+    // says so with `payment_outcome` "pending" or "paid". Neither the recovery
+    // door nor a second entry is right here - recovery would answer "no paid
+    // seat, call pay_entry", and that call is exactly how an agent pays twice.
+    // Checked BEFORE the 409 below, which otherwise sends every 409 into
+    // recovery. The test is the OUTCOME, not `sign_new_payment: false` alone:
+    // an empty wallet carries that flag too (a new signature cannot fix it),
+    // yet nothing is moving there, and "wait" would be a lie.
+    // 'unknown' is this door's own word (lostPaidAnswer): the signed entry
+    // request lost its answer - the same wait, the same single repeat.
+    if (data && ((data.sign_new_payment !== true && (data.payment_outcome === 'pending' || data.payment_outcome === 'paid'))
+      || data.payment_outcome === 'unknown')) {
+      const text = 'YOUR ENTRY PAYMENT IS STILL SETTLING - do not call pay_entry again yet, and do not pay the entry by any other route. '
+        + `The game cannot say yet whether it went through (payment_outcome: ${data.payment_outcome}). `
+        + 'Wait retry_after_seconds, then call pay_entry once more: if the payment landed, the game refuses a second charge '
+        + 'and this door collects your key; if it never landed, nothing was charged and that call pays the entry afresh.'
+        + `\n\n${JSON.stringify(data, null, 2)}`
+      return { content: [{ type: 'text', text: maskAgentKey(text) }] }
+    }
     // Two answers mean "the seat is paid, the key is not in this response":
     // a repeat of the same payment (200 with api_key: null) and a fresh attempt
     // from a wallet that already has a kingdom (409). Both carry key_recovery.
@@ -693,9 +1043,21 @@ server.tool(
     // key is gone, and the seat is worth $50. Only when nothing is saved - the
     // guard lives in recoverApiKey.
     const paidButKeyless = (data && data.api_key === null) || status === 409 || !!data?.key_recovery
+    // A key file from an earlier tournament must not block the recovery of
+    // this one's seat (review of wave 1 recheck): checked, and removed on a 401.
+    // A refused one is removed; one the game could not be asked about is named (round 3).
+    const savedKey = paidButKeyless ? await storedAgentKeyVerdict() : null
+    const refusedKeyNote = savedKey?.note ?? null
     if (paidButKeyless && !readStoredKey(walletAddress)) {
       const rec = await recoverApiKey()
-      const text = `${rec.why}\n\n${JSON.stringify(rec.data ?? data, null, 2)}`
+      // A 409 with no recovery hint is "the field is full"; the probe only asked
+      // whether this wallet already holds one of those seats. When it does not,
+      // the field's refusal is the answer - not "recovery was refused".
+      const fieldRefusal = status === 409 && !data?.key_recovery && rec.noSeat
+      const body = fieldRefusal
+        ? `The entry door refused: ${data?.error || 'the field is full'}\n\nThis door checked with a wallet signature: this wallet holds no seat in this tournament, so nothing was charged and no key is owed.\n\n${JSON.stringify(data, null, 2)}`
+        : `${rec.why}\n\n${JSON.stringify(rec.data ?? data, null, 2)}`
+      const text = refusedKeyNote ? `${refusedKeyNote}\n\n${body}` : body
       return { content: [{ type: 'text', text: rec.raw ? text : maskAgentKey(text) }] }
     }
     // The key is revealed exactly once. Before this, the whole answer went into
@@ -719,8 +1081,16 @@ server.tool(
       if (res.saved) data.api_key = '<saved by the door>'
       else masked = false   // the key MUST stay readable: it is the only copy
     }
-    const text = note
-      ? `${note}\n\n${JSON.stringify(data, null, 2)}`
+    // The human's key goes to a file too (13.09, C9 recon): before this it
+    // lived only in this one answer, and a lost answer meant a human who
+    // never learned they had a cabinet.
+    const uncheckedKeyNote = savedKey?.state === 'unknown'
+      ? `This seat is paid; the key saved on this machine could not be checked with the game just now (${savedKey.status ? `HTTP ${savedKey.status}` : 'no answer'}). `
+        + 'Nothing more was charged - do NOT pay again. Call recover_api_key in a minute, and name your kingdom (register) before the opening gong.'
+      : null
+    const notes = [refusedKeyNote, uncheckedKeyNote, note, operatorKeyNote(data?.operator_key)].filter(Boolean)
+    const text = notes.length
+      ? `${notes.join('\n\n')}\n\n${JSON.stringify(data, null, 2)}`
       : JSON.stringify(data, null, 2)
     // Belt and braces: any other raw agent key anywhere in the payload (a hint,
     // a recovery block) is masked too - but never when the save failed, because
@@ -734,7 +1104,7 @@ server.tool(
 // 0f. RECOVER API KEY — the entry answer was lost, the seat is paid
 server.tool(
   'recover_api_key',
-  'Use this when your entry payment went through but you never got the api_key - the answer was cut off, the call timed out, or your session restarted before you saved it. Your wallet proves the seat is yours: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY, and saves the re-issued key. Works only while your kingdom is still unnamed (before register); after you name it, no path returns the agent key again. It is refused if a key is already saved, because every recovery kills the previous key. It never pays a second entry fee.',
+  'Use this when your entry payment went through but you never got the api_key - the answer was cut off, the call timed out, or your session restarted before you saved it. Your wallet proves the seat is yours: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY, and saves the re-issued key. Works only while your kingdom is still unnamed (before register); after you name it, no path returns the agent key again. A key already saved is checked with the game first: one it refuses is removed and recovery goes on; a working one is kept and recovery is refused (every recovery kills the previous key); one it could not be asked about is left alone - call again in a minute. It never pays a second entry fee.',
   {},
   async () => {
     const rec = await recoverApiKey()
@@ -1133,7 +1503,11 @@ server.tool(
 // layer that outlives the API key).
 server.tool(
   'tournament_results',
-  'The settled final table of a past tournament - public, no auth, it outlives your key. Pass wallet for one wallet\'s place and tickets (this is where your run lives after the closing gong revokes your key); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive.',
+  // 13.09 (C9 recon): this used to claim the key died with the closing gong,
+  // which was false. By src/api/middleware/auth.js the key lives through
+  // the gong, the freeze and the final table and dies at the transition, when
+  // the next tournament is announced; a cancelled tournament kills it at once.
+  'The settled final table of a past tournament - public, no auth, it outlives your key. Pass wallet for one wallet\'s place and tickets (your key keeps working through the closing gong and the final table and is retired when the next tournament is announced - at once if a tournament is called off; from then on this is where your run lives); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive.',
   {
     wallet: z.string().optional().describe('Optional wallet address - your own place and tickets'),
     tournament: z.number().int().positive().optional().describe('Optional public tournament number - a past table instead of the latest'),

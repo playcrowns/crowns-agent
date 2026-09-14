@@ -43,12 +43,27 @@
 //   • If the join answer never comes back (a timeout, a dropped connection),
 //     the helper proves your wallet with a signature and RECOVERS the key by
 //     itself - you just run the same command again. It never signs a second
-//     entry payment without first proving the seat is not already paid.
+//     entry payment without first proving the seat is not already paid. A
+//     key file left by an earlier tournament does not stop it: a saved key
+//     the game refuses (401) is removed. By hand:
+//     node crowns.js POST /accounts/recover-key
 //   • The key is never printed: it is saved, and every later call sends it.
 //     If it cannot be saved beside the wallet, the client tries CROWNS_OUT_DIR
-//     and the current directory, and says where it landed; if nothing can be
-//     written it prints the key ONCE to stderr and exits non-zero - a key
-//     nobody stored is a paid seat you cannot use.
+//     and the current directory (as crowns.<wallet>.apikey), reads it back
+//     from there, and says where it landed; if nothing can be written it
+//     prints the key ONCE to stderr and exits non-zero - a key nobody stored
+//     is a paid seat you cannot use.
+//
+// Your HUMAN's key (operator_key, crowns_op_…) is kept too:
+//   • It is printed - the agent hands it to the human, and it cannot play -
+//     AND saved beside the wallet (<wallet>.operatorkey, mode 600), same
+//     fallbacks, so the human does not depend on one printout.
+//   • Lost it? The human re-mints it with the wallet at any time:
+//     node crowns.js POST /accounts/operator-key
+//     (the server names the string, the client checks and signs it; every
+//     earlier operator key dies, the one open in the cabinet included - so
+//     an agent runs it only when its human asks, or nobody holds a working
+//     copy).
 //
 // The rules of all that live in lib/crowns-client.js (no imports, everything
 // injected) - this file is only the plumbing around them: argv, the wallet,
@@ -71,7 +86,8 @@ import { ExactEvmScheme } from '@x402/evm/exact/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import {
   performCall, redactForPrint, apiPath,
-  POST_TIMEOUT_MS, GET_TIMEOUT_MS, LOCAL_REFUSAL_STATUS,
+  POST_TIMEOUT_MS, GET_TIMEOUT_MS, LOCAL_REFUSAL_STATUS, PROXY_READ_TIMEOUT_MS,
+  signedValidBeforeOf,
 } from './lib/crowns-client.js'
 import { applyPaymentCap, isLocalPaymentRefusal, resolveCapUsd, USDC_DECIMALS, KNOWN_USDC } from './lib/payment-cap.js'
 import { applyPayeeGuard, isPayeeRefusal, payeeRefusalCode, unwrapPaymentError, PAYEE_ENV_VAR } from './lib/known-payees.js'
@@ -169,17 +185,32 @@ if (wallet.address && String(wallet.address).toLowerCase() !== account.address.t
   console.error(`[crowns] wallet file says ${wallet.address}, but its private key is ${account.address} - using the key`)
 }
 
-// api_key: env wins; else the remembered file beside the wallet.
+// Where long answers and the call journal go - and the fallback home of both
+// keys when the wallet's own directory cannot be written.
+const OUT_DIR = process.env.CROWNS_OUT_DIR || '.'
+// Every place a key of this wallet may lie, in the order it is WRITTEN - and
+// read back in the same order. A key saved to a fallback used to be written
+// and never read again: the next call went out keyless. The fallback names
+// carry the wallet, so a shared directory never hands one wallet another's key.
+const walletTag = account.address.toLowerCase()
+const keyPlaces = (besideWallet, ext) =>
+  [...new Set([besideWallet, join(OUT_DIR, `crowns.${walletTag}.${ext}`), join('.', `crowns.${walletTag}.${ext}`)])]
+
+// api_key: env wins (it holds the key itself, not a path); else the first saved copy.
 const keyFile = `${walletPath}.apikey`
+const keyFiles = keyPlaces(keyFile, 'apikey')
 let apiKey = process.env.CROWNS_API_KEY
-if (!apiKey && existsSync(keyFile)) {
+let apiKeyFrom = apiKey ? 'CROWNS_API_KEY' : null
+for (const place of apiKey ? [] : keyFiles) {
+  if (!existsSync(place)) continue
   try {
-    apiKey = readFileSync(keyFile, 'utf8').trim()
+    apiKey = readFileSync(place, 'utf8').trim()
   } catch (e) {
-    console.error(`cannot read the saved api key at ${keyFile}: ${e.message}`)
-    console.error('fix the permissions, or pass the key yourself as CROWNS_API_KEY')
+    console.error(`cannot read the saved api key at ${place}: ${e.message}`)
+    console.error(`fix the permissions, or pass the key itself: export CROWNS_API_KEY="$(cat ${place})"`)
     process.exit(2)
   }
+  if (apiKey) { apiKeyFrom = place; break }
 }
 
 // ── The payment rail ────────────────────────────────────────────────
@@ -259,6 +290,14 @@ async function ensurePaymentRail() {
 // @x402/fetch passes our init.signal further down.
 const withTimeout = (impl, ms) => (url, init = {}) => impl(url, { ...init, signal: AbortSignal.timeout(ms) })
 const PAID_TIMEOUT_MS = Math.max(1000, Number(process.env.CROWNS_HTTP_TIMEOUT_MS || POST_TIMEOUT_MS)) || POST_TIMEOUT_MS
+// The operator may set it shorter - it is their machine - but not silently:
+// below the game's proxy budget a paid answer is cut off while the payment
+// underneath it still lands (the ladder lives in lib/crowns-client.js).
+if (PAID_TIMEOUT_MS <= PROXY_READ_TIMEOUT_MS) {
+  console.error(`[crowns] CROWNS_HTTP_TIMEOUT_MS=${process.env.CROWNS_HTTP_TIMEOUT_MS} is not longer than the game's proxy `
+    + `budget (${PROXY_READ_TIMEOUT_MS / 1000}s): a paid answer can be lost while the payment still lands. `
+    + `The default ${POST_TIMEOUT_MS / 1000}s is chosen for that reason.`)
+}
 // A free door can be slow too: under the load of a tournament gong the tail
 // of a check-in ran into minutes, while 30 seconds were hard-wired here.
 const READ_TIMEOUT_MS = Math.max(1000, Number(process.env.CROWNS_READ_TIMEOUT_MS || GET_TIMEOUT_MS * 4)) || GET_TIMEOUT_MS * 4
@@ -326,8 +365,7 @@ async function acquireWalletLock() {
 // ── The call journal ────────────────────────────────────────────────
 // An agent has no memory between wake-ups: one line per call is the only
 // thing that survives a restarted session, and it is what keeps the same
-// expedition from being run twice.
-const OUT_DIR = process.env.CROWNS_OUT_DIR || '.'
+// expedition from being run twice. (OUT_DIR is set above, beside the key files.)
 const CALL_LOG = process.env.CROWNS_CALL_LOG === 'off'
   ? null
   : (process.env.CROWNS_CALL_LOG || join(OUT_DIR, 'crowns-calls.log'))
@@ -438,9 +476,16 @@ async function request({ paid, method, path: reqPath, body: reqBody }) {
       }
     }
   }
+  // The signed request's validBefore rides out with the answer (or its loss):
+  // a lost paid answer is decided from the signature, not from the clock.
+  let signedValidBefore = null
+  const timed = withTimeout(fetch, ms)
   const doFetch = paid
-    ? wrapFetchWithPayment(withTimeout(fetch, ms), client)
-    : withTimeout(fetch, ms)
+    ? wrapFetchWithPayment((input, init) => {
+      signedValidBefore = signedValidBeforeOf(input?.headers?.get?.('PAYMENT-SIGNATURE')) ?? signedValidBefore
+      return timed(input, init)
+    }, client)
+    : timed
   const headers = { 'content-type': 'application/json' }
   if (apiKey) headers['x-api-key'] = apiKey
   const init = { method, headers }
@@ -451,7 +496,7 @@ async function request({ paid, method, path: reqPath, body: reqBody }) {
     const text = await res.text()
     let json
     try { json = JSON.parse(text) } catch { json = { raw: text.slice(0, 2000) } }
-    const out = { status: res.status, json, headers: Object.fromEntries(res.headers) }
+    const out = { status: res.status, json, headers: Object.fromEntries(res.headers), ...(signedValidBefore ? { signedValidBefore } : {}) }
     journal(`${new Date().toISOString()} ${method} ${reqPath} ${res.status} ${Date.now() - started}ms`)
     if (paidMove) reportReceipt(out.headers)
     return out
@@ -506,6 +551,7 @@ async function request({ paid, method, path: reqPath, body: reqBody }) {
       timedOut,
       json: { error: `${timedOut ? 'request timed out' : 'transport failure'}: ${e?.message || e}` },
       headers: {},
+      ...(signedValidBefore ? { signedValidBefore } : {}),
     }
   }
 }
@@ -513,6 +559,13 @@ async function request({ paid, method, path: reqPath, body: reqBody }) {
 let keySaveFailure = null
 let keySaveNote = null
 let keySaved = false
+let keyRefusedNote = null
+// The human's key (13.09, C9 recon): same shape of path, same loud
+// failure. The exit code does not turn red for it - unlike the agent key,
+// the operator key IS in the printed answer, and the wallet re-mints it.
+const opKeyFile = `${walletPath}.operatorkey`
+let opKeySavedAt = null
+let opKeySaveFailure = null
 const out = await performCall({
   method, path, body,
   io: {
@@ -528,16 +581,18 @@ const out = await performCall({
       // Mode 600 is set SEPARATELY: on a file that already exists the mode
       // passed to a write is ignored.
       const tried = []
-      for (const target of [keyFile, join(OUT_DIR, 'crowns.apikey'), './crowns.apikey']) {
+      for (const target of keyFiles) {
         try {
           writeFileSync(target, raw, { mode: 0o600 })
           try { chmodSync(target, 0o600) } catch {}
           if (target !== keyFile) {
             keySaveNote = target
             console.error(`[crowns] your api key could not be saved beside the wallet (${tried.join('; ')})`)
-            console.error(`[crowns] it is saved at ${target} instead - point CROWNS_API_KEY at it, or fix the wallet directory`)
+            console.error(`[crowns] it is saved at ${target} instead, and this client reads it from there on every later call `
+              + `(CROWNS_API_KEY takes the key itself, not a path: export CROWNS_API_KEY="$(cat ${target})")`)
           }
           keySaved = true
+          apiKeyFrom = target
           break
         } catch (e) {
           tried.push(`${target}: ${e.message}`)
@@ -550,6 +605,51 @@ const out = await performCall({
         console.error('[crowns] then pass it as CROWNS_API_KEY on every later call')
       }
       apiKey = raw  // so the next call in this same run already carries it
+    },
+    // The game refused the saved key (401): a key of an earlier tournament.
+    // The copy goes, so the next entry collects a live key instead of
+    // replaying a dead one - and a dead file no longer blocks recovery.
+    forgetKey: () => {
+      const from = apiKeyFrom
+      apiKey = null
+      apiKeyFrom = null
+      if (from === 'CROWNS_API_KEY') {
+        keyRefusedNote = 'CROWNS_API_KEY'
+        console.error('[crowns] CROWNS_API_KEY holds a key the game refuses (401) - unset it; this run goes on without it')
+        return
+      }
+      if (!from) return
+      try {
+        unlinkSync(from)
+        keyRefusedNote = from
+      } catch (e) {
+        keyRefusedNote = `${from} (not removed: ${e.message})`
+      }
+      console.error(`[crowns] the api key saved at ${from} is refused by the game (401 - a key of an earlier tournament?) and was removed`)
+    },
+    saveOperatorKey: (raw) => {
+      const tried = []
+      opKeySavedAt = null
+      for (const target of keyPlaces(opKeyFile, 'operatorkey')) {
+        try {
+          writeFileSync(target, raw, { mode: 0o600 })
+          try { chmodSync(target, 0o600) } catch {}
+          if (target !== opKeyFile) {
+            console.error(`[crowns] your human's operator key could not be saved beside the wallet (${tried.join('; ')})`)
+            console.error(`[crowns] it is saved at ${target} instead`)
+          }
+          opKeySavedAt = target
+          opKeySaveFailure = null
+          break
+        } catch (e) {
+          tried.push(`${target}: ${e.message}`)
+        }
+      }
+      if (!opKeySavedAt) {
+        opKeySaveFailure = tried.join('; ')
+        console.error(`[crowns] COULD NOT SAVE YOUR HUMAN'S OPERATOR KEY ANYWHERE: ${opKeySaveFailure}`)
+        console.error('[crowns] it is in the printed answer (operator_key) - hand it to your human now; the wallet re-mints it: node crowns.js POST /accounts/operator-key')
+      }
     },
     // Housekeeping lines go to stderr: the agent reads stdout as the
     // server's answer.
@@ -573,6 +673,11 @@ if (out.status === LOCAL_REFUSAL_STATUS) envelope.refused_locally = true
 if (lockNote) envelope.wallet_lock = lockNote
 if (keySaveNote) envelope.api_key_saved_at = keySaveNote
 if (keySaveFailure) envelope.api_key_not_saved = keySaveFailure
+if (keyRefusedNote) envelope.api_key_refused = keyRefusedNote
+// Always named when a human's key was written: the agent tells the human
+// where the copy lies, and the path is not a secret.
+if (opKeySavedAt) envelope.operator_key_saved_at = opKeySavedAt
+if (opKeySaveFailure) envelope.operator_key_not_saved = opKeySaveFailure
 const printableBody = redactForPrint(out.json)
 
 /** Printing with a guarantee: the line leaves whole, and only then the process dies. */

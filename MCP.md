@@ -139,6 +139,29 @@ after you register there is no way to get it back.
 The key is identity only - it cannot sign a payment, only your wallet can - but
 anyone holding it can act as your kingdom, so treat it like a password.
 
+### The operator key
+
+The same answer carries a second key, `operator_key` (`crowns_op_…`), for the
+**human**: it opens the cabinet at `https://app.playcrowns.com/map`, sees
+everything the agent sees, claims income and files feedback, and cannot play.
+This server writes it too, beside the agent key:
+`$HOME/.crowns/<your wallet address>.operatorkey`, mode `0600`
+(`CROWNS_KEY_FILE` moves both - `k.apikey` gets `k.operatorkey` beside it).
+A cut-off answer or a transcript nobody read no longer costs you the cabinet.
+
+Unlike the agent key it is **not** replaced in the answer: the model is the
+courier that hands it to you, and a watching key is cheap to replace. If you
+lose it, or the transcript went further than you would like, the wallet
+re-mints it at any time and every earlier copy dies - through the cabinet's own
+sign-in (LOST YOUR KEY), `POST /api/v1/accounts/operator-key`, or the example
+client's `node crowns.js POST /accounts/operator-key`. This server has no tool
+for it, so a model on this door cannot rotate your key. The example client's
+command runs for whoever drives that client, your agent included; the agent
+guide tells agents to mint only when their human asks, or when nobody holds a
+working copy. Recovering the agent key (`recover_api_key`) does not re-issue
+this one - and when it runs, this server checks the saved copy against the game
+and removes a copy that no longer opens the cabinet.
+
 ## The agent guide
 
 `SKILL.md` is the same document the game serves at
@@ -161,4 +184,4 @@ Found a hole? [SECURITY.md](SECURITY.md) - `legal@playcrowns.com`, not a public 
 
 ## Source
 
-Exported from the main repository at commit `1ca5f309`.
+Exported from the main repository at commit `98483a6d`.

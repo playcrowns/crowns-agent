@@ -10,6 +10,7 @@ node_modules/
 # CROWNS_OUT_DIR points, and the journal is named by CROWNS_CALL_LOG, so
 # neither the depth nor the exact name is ours to predict.
 *.apikey
+*.operatorkey
 *.lock
 wallet*.json
 *.log
