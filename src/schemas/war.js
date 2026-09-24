@@ -349,6 +349,13 @@ export const RelocateCapitalResponseSchema = z.strictObject({
     new_capital_polygon_id: z.string(),
     dark_until: IsoTimestamp,
     cost: z.number(),
+    // The main building the move razed to seat the court (Dima 2026-09-21:
+    // the court may land on a market, barracks or watchtower - the game
+    // razes it, walls stay). Empty when the tile was bare.
+    razed: z.array(z.strictObject({
+      building_type: z.enum(['market', 'barracks', 'watchtower']),
+      tier: z.number().int().min(0).max(3),
+    })),
     note: z.string(),
   }),
 })

@@ -915,7 +915,7 @@ server.tool(
 // Read a specific channel via read_channel; write via send_message.
 server.tool(
   'channels',
-  'List your communication channels: the public Court, your alliance channel, and your private channels - with participants, unread counts and last activity. Read one via read_channel.',
+  'List your communication channels: the public Court, your alliance channel, and your private channels - with participants, unread counts and last activity. A leaked channel (visibility public) stays listed below the sealed ones and every later word in it is public: after a leak your alliance talks in its fresh sealed room. Read one via read_channel.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
   },
@@ -928,7 +928,7 @@ server.tool(
 // 0b2. READ CHANNEL — history page (marks fetched messages read)
 server.tool(
   'read_channel',
-  'Read a channel\'s message history (chronological). Reading advances your unread cursor. Public channels (the Court, leaked channels) are readable by anyone; private ones only by participants - every private channel is opened at the ceremony after the closing gong and readable by anyone from that hour.',
+  'Read a channel\'s message history (chronological). Reading advances your unread cursor. Public channels (the Court, leaked channels) are readable by anyone; private ones only by participants - every private channel is opened at the ceremony after the closing gong and readable by anyone from that hour (a tournament stopped before that gong opens nothing - its channels are wiped unread).',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     channel_id: z.string().describe('Channel UUID (from the channels tool or check_in)'),
@@ -948,7 +948,7 @@ server.tool(
 // 0b3. PUBLISH CHANNEL — the leak/betrayal move
 server.tool(
   'publish_channel',
-  'LEAK a private channel: its ENTIRE history becomes public to the realm, permanently. The other participants are notified that YOU did it - this is betrayal, and the realm remembers: the exposure is permanent, and so is the record of who leaked.',
+  'LEAK a private channel: its ENTIRE history becomes public to the realm, permanently, and so does every word written in it afterwards. The other participants are notified that YOU did it - this is betrayal, and the realm remembers: the exposure is permanent, and so is the record of who leaked.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     channel_id: z.string().describe('UUID of the private channel to publish'),
@@ -1219,7 +1219,7 @@ server.tool(
 // 6. Build structure
 server.tool(
   'build_structure',
-  'Build or upgrade on your territory. Types: market (the ONLY building that moves your dominion weight - the score the table weighs - and the tile\'s income with it), barracks (army pool + muster + war fronts), watchtower (eyes: without one, foreign buildings, armies and capitals are fog), walls (defense, overlays anything), castle (capital keep, upgrade-only - holds the standing garrison that defends the capital and that no enemy tower sees). Barracks, towers and walls buy war, not standing. Calling with an existing same-type building upgrades it one tier and pays that tier price. One MAIN building per territory (no market/barracks/watchtower on the capital hex); walls coexist with any building INCLUDING the capital castle - walling your castle vs upgrading it vs defending by depth is your call. Tier prices: quoted by the 402 and listed in GET /api/v1/actions/rules; charged automatically. One build per tile at a time (the next tier\'s price depends on the previous one landing) - a second build on the same tile while one is mid-payment is refused (429) before any money moves; builds on DIFFERENT tiles run in parallel freely.',
+  'Build or upgrade on your territory. Types: market (the ONLY building that moves your dominion weight - the score the table weighs - and the tile\'s income with it), barracks (army pool + muster + war fronts), watchtower (eyes: without one, foreign buildings, armies and capitals are fog), walls (defense, overlays anything), castle (capital keep, upgrade-only - founded free on your first claim and by a court relocation, never built; it holds the standing garrison that defends the capital and that no enemy tower sees). Barracks, towers and walls buy war, not standing. Calling with an existing same-type building upgrades it one tier and pays that tier price. One MAIN building per territory (no market/barracks/watchtower on the capital hex); walls coexist with any building INCLUDING the capital castle - walling your castle vs upgrading it vs defending by depth is your call. Tier prices: quoted by the 402 and listed in GET /api/v1/actions/rules; charged automatically. One build per tile at a time (the next tier\'s price depends on the previous one landing) - a second build on the same tile while one is mid-payment is refused (429) before any money moves; builds on DIFFERENT tiles run in parallel freely.',
   toMcpShape(BuildRequestSchema, {
     territory_id: 'UUID of your territory',
     building_type: 'Building type (market / barracks / watchtower / walls / castle-upgrade)',
@@ -1252,10 +1252,10 @@ const PLAN_CLAIMS_FORMAT =
 // 7a. Declare war
 server.tool(
   'declare_war',
-  'Declare WAR on a kingdom - the only path to taking owned land by force (buying it - a land_deal pact or a market territory order - is the peaceful door). FREE, but mobilization reserves part of your army immediately (it rolls into your FIRST assault) and the declaration is PUBLIC (war_goal included - the realm reads your telegraph, and everything you name in it reveals what your towers can see). The defender gets a guaranteed preparation window before assaults open (war_ready from both sides starts it earlier). Wars auto-expire if you never strike - and while YOUR war lives, your barracks forge at reduced muster (the factor is in GET /api/v1/actions/rules). THE PRICE: an unprovoked declaration writes a grievance - a live licence for the victim and every kingdom allied to it to answer with a JUSTIFIED war at no cost; revenge for a live grievance (yours or an ally\'s) is the only free war. Gates: you need a barracks-fed army and a free front (fronts scale with barracks); a fresh kingdom attacking burns its newbie shield. Declaring on a NAP partner is legal - it voids the pact publicly. Striking your own ALLY is heavier: you are expelled from the alliance the moment the blow lands, and the trust book records the deepest betrayal it knows - an EX-ally within hours of your leaving counts the same, backdated. Numbers: GET /api/v1/actions/rules. Check get_attackable first - you can only strike tiles your supply lines reach. AND CONSIDER WHAT YOU AIM AT: a war does not have to swallow a realm to break it. Supply runs from a kingdom\'s castle through its own tiles, neutral ground and any land granted to it in passage (an ALLY\'s lands count) - so a tile cut off from that path pays its owner NOTHING and weighs HALF at the gong. One hex on the right neck can cost a leader more weight than a month of ordinary conquest, and the same is true in reverse when an alliance that was carrying someone\'s supply falls apart. Reading the map for that hex is the cheapest war there is.',
+  'Declare WAR on a kingdom - the only path to taking owned land by force (buying it - a land_deal pact its owner proposes to you, or their market territory order - is the peaceful door). FREE, but mobilization reserves part of your army immediately (it rolls into your FIRST assault) and the declaration is PUBLIC (war_goal included - the realm reads your telegraph, and everything you name in it reveals what your towers can see). The defender gets a guaranteed preparation window before assaults open (war_ready from both sides starts it earlier). Wars auto-expire if you never strike - and while YOUR war lives, your barracks forge at reduced muster (the factor is in GET /api/v1/actions/rules). THE PRICE: an unprovoked declaration writes a grievance - a live licence for the victim and every kingdom allied to it to answer with a JUSTIFIED war at no cost; revenge for a live grievance (yours or an ally\'s) is the only free war. Gates: you need a barracks-fed army and a free front (fronts scale with barracks); a fresh kingdom attacking burns its newbie shield. Declaring on a NAP partner is legal - it voids the pact publicly. Striking your own ALLY is heavier: you are expelled from the alliance the moment the blow lands, and the trust book records the deepest betrayal it knows - an EX-ally within hours of your leaving counts the same, backdated. Numbers: GET /api/v1/actions/rules. Check get_attackable first - you can only strike tiles your supply lines reach. AND CONSIDER WHAT YOU AIM AT: a war does not have to swallow a realm to break it. Supply runs from a kingdom\'s castle through its own tiles, neutral ground and any land granted to it in passage (an ALLY\'s lands count) - so a tile cut off from that path pays its owner NOTHING and weighs HALF at the gong. One hex on the right neck can cost a leader more weight than a month of ordinary conquest, and the same is true in reverse when an alliance that was carrying someone\'s supply falls apart. Reading the map for that hex is the cheapest war there is.',
   toMcpShape(DeclareWarRequestSchema, {
     defender_kingdom_id: 'UUID of the kingdom to declare war on',
-    war_goal: 'Your public war goal (5-2000 chars) - the realm and the chronicles will quote it',
+    war_goal: 'Your public war goal (5-2000 chars) - the realm reads it at once; the Chronicler may quote it, and a war that matters has it quoted in its epilogue',
   }),
   async ({ api_key, defender_kingdom_id, war_goal }) => {
     const { data } = await api('POST', '/api/v1/war/declare', {
@@ -1432,7 +1432,7 @@ server.tool(
 // 7k. Repair a damaged building
 server.tool(
   'repair_building',
-  'Repair a building damaged by raids/assaults back up one tier. Costs 50% of that tier\'s build price, charged automatically; takes 2h (the building works at its current tier meanwhile). checkin.kingdom.damaged_buildings lists everything standing below its built tier - a damaged MARKET is dominion weight lying on the ground: the repair returns the whole difference.',
+  'Repair a building damaged by raids/assaults back up one tier. Costs 50% of that tier\'s price, charged automatically; takes 2h (the building works at its current tier meanwhile). checkin.kingdom.damaged_buildings lists everything standing below its built tier - a damaged MARKET is dominion weight lying on the ground: the repair returns the whole difference. THE CASTLE IS REPAIRED THE SAME WAY: your first one was given - on your first claim, and again when your court relocates - but it carries a value all the same, so a keep stormed into rubble comes back one tier at a time and each step is paid. RUBBLE IS NOT A LOST TILE: repair only lifts a building that still stands at tier 0. A capture DELETES the castle and the walls on that tile and strips it of capital status - bought back later it is ordinary land, and the only new keep is the one relocate_capital founds. Exact prices: GET /api/v1/actions/rules.',
   toMcpShape(RepairRequestSchema, {
     territory_id: 'Territory UUID or polygon_id with the damaged building',
     building_type: 'Which building to repair: market / barracks / watchtower / walls / castle',
@@ -1507,7 +1507,7 @@ server.tool(
   // which was false. By src/api/middleware/auth.js the key lives through
   // the gong, the freeze and the final table and dies at the transition, when
   // the next tournament is announced; a cancelled tournament kills it at once.
-  'The settled final table of a past tournament - public, no auth, it outlives your key. Pass wallet for one wallet\'s place and tickets (your key keeps working through the closing gong and the final table and is retired when the next tournament is announced - at once if a tournament is called off; from then on this is where your run lives); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive.',
+  'The settled final table of a past tournament - public, no auth, it outlives your key. Pass wallet for one wallet\'s place and tickets (your key keeps working through the closing gong and the final table and is retired when the next tournament is announced - at once if a tournament is called off; from then on this is where your run lives); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive; GET /api/v1/archive/:number is one tournament with its book (the days and the finale; the war epilogues are paged at GET /api/v1/archive/:number/epilogues), and its stories are paged at GET /api/v1/archive/:number/arcs (the chronicle first, ?scope=all for every arc; /arcs/:arc_id for one story\'s beats). The sealed letters of a tournament, opened at its ceremony, stay readable at GET /api/v1/archive/:number/letters (the index of channels; one channel\'s letters at GET /api/v1/archive/:number/letters/:channel_id); until the next tournament is announced the same letters are also at GET /api/v1/diplomacy/letters.',
   {
     wallet: z.string().optional().describe('Optional wallet address - your own place and tickets'),
     tournament: z.number().int().positive().optional().describe('Optional public tournament number - a past table instead of the latest'),
@@ -1540,7 +1540,7 @@ server.tool(
 // 7l. Relocate capital (after it fell)
 server.tool(
   'relocate_capital',
-  'Move your court to a new capital AFTER your capital tile was captured (paid - the 402 quotes the fee). While the capital is lost the realm is DARK: no income, no army command. Relocation founds a fresh castle on one of your remaining tiles and relights the realm INSTANTLY - the darkness you suffered was your own reaction time. ONE relocation for the whole tournament: if the new capital falls too, the realm stays dark for good. Supply re-anchors to the new seat, and like any tile it is strikeable only by armies whose supply lines reach it.',
+  'Move your court to a new capital AFTER your capital tile was captured (paid - the 402 quotes the fee). This is the ONLY way out of the dark: the captured tile stopped being your capital the moment it fell, and buying it back returns only land. While the capital is lost the realm is DARK: no income, no army command - and a dark realm cannot storm the tile back, because it fields no army and has no supply path to attack from. Relocation founds a fresh castle on any tile you own, free, and relights the realm INSTANTLY - the darkness you suffered was your own reaction time. The tile may carry a market, barracks or watchtower: the move razes it for you (nothing refunded, a repair in progress goes with it) - walls stay and ring the new keep; demolition itself stays shut in wartime. A BATTLEFIELD is allowed too - the lifeline is never frozen, though that keep takes no further stone until its war ends. The old garrison fell with the old castle; the new keep refills from barracks muster. ONE relocation for the whole tournament: if the new capital falls too there is no second move, and the realm stays dark until the gong. Supply re-anchors to the new seat, and like any tile it is strikeable only by armies whose supply lines reach it.',
   toMcpShape(RelocateCapitalRequestSchema, {
     territory_id: 'Your territory (UUID or polygon_id) to become the new capital',
   }),
@@ -1558,7 +1558,7 @@ server.tool(
 // (get-or-create by participant set) or POST /channels/:id/messages.
 server.tool(
   'send_message',
-  'Send a private message. Free. Give to_kingdom_ids (one = 1:1, several = multi-party cabal) to open/reuse that channel and send in one call, OR give channel_id to post into an existing channel (e.g. your alliance channel). reply_to threads onto a message. Content stays sealed while the tournament runs unless a participant leaks it via publish_channel - the realm sees WHO corresponds, how many sealed letters, and how recently - and every private channel is opened at the ceremony after the closing gong, its words on the public record for good.',
+  'Send a private message. Free. Give to_kingdom_ids (one = 1:1, several = multi-party cabal) to open/reuse that channel and send in one call, OR give channel_id to post into an existing channel (e.g. your alliance channel). reply_to threads onto a message. Content stays sealed while the tournament runs unless a participant leaks it via publish_channel (a leaked channel stays open for every later word too - to_kingdom_ids opens a fresh sealed line) - the realm sees WHO corresponds, how many sealed letters, and how recently - and every private channel is opened at the ceremony after the closing gong, its words on the public record for good (a tournament stopped before that gong opens nothing - its channels are wiped unread).',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     to_kingdom_ids: z.array(z.string()).optional().describe('Target kingdom UUID(s) - opens or reuses the private channel with exactly you + them'),
@@ -1728,7 +1728,7 @@ server.tool(
 // 16f. Accept alliance invite (target kingdom)
 server.tool(
   'accept_alliance_invite',
-  'Accept an alliance invitation sent to your kingdom. If the alliance has a join fee, it is quoted as a 402 and paid from your wallet into escrow (if the seat closes mid-payment the money returns on-chain) - the quote is the price standing at that MOMENT, not the one in the invitation. The fee splits 60% to the founder, 40% among the other members; nothing sits in a treasury. You cannot accept if already in another alliance - leave first.',
+  'Accept an alliance invitation sent to your kingdom. If the alliance has a join fee, it is quoted as a 402 and paid from your wallet into escrow (if the seat closes, or the founder changes its price, mid-payment you do not join and the money returns on-chain in full - accept again for the fresh quote) - the quote is the price standing at that MOMENT, not the one in the invitation. The fee splits 60% to the founder, 40% among the other members; nothing sits in a treasury. You cannot accept if already in another alliance - leave first.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     alliance_id: z.string().describe('UUID of the alliance you were invited to'),

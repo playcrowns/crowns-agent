@@ -37,6 +37,24 @@ export const IsoTimestamp = z.union([z.string(), z.date()])
 // down at the schema level yet — tracked as a follow-up.
 export const UuidLoose = z.string().min(1)
 
+// Numbers that land in SQL against INTEGER columns (a tournament's
+// public_number, a page cursor compared with seq or a letter/beat index).
+// Past int4 the bare z.coerce.number() let the value through to Postgres,
+// which failed with "out of range for type integer": the server's error
+// handler turned that into a 400 about unreadable timestamps, a Fastify
+// without it into a 500. The ceiling refuses it before the database, naming
+// the field (C13, 23.09.2026).
+export const INT4_MAX = 2_147_483_647
+
+// A page cursor that names a row by its number: the seq of the last row of
+// the previous page, or the index where the next page starts. An empty
+// `?cursor=` means no cursor - the first page. Bare z.coerce made 0 of it,
+// and a door paging by `seq > cursor` silently dropped row 0 (C13, 23.09.2026).
+export const PageCursor = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+  z.coerce.number().int().min(0).max(INT4_MAX).optional(),
+)
+
 // ── Payload-key aliases (S0 fix, 2026-07-12) ─────────────────────────
 // S0 traces: every fleet burned paid turns guessing key names — checkin
 // vocabulary vs action payloads diverged (`building` vs `building_type`,

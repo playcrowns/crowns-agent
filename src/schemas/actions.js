@@ -71,8 +71,11 @@ export const ClaimRequestSchema = withPayloadAliases(z.object({
 // the existing same-type building by one tier (price = that tier's price;
 // the slot/tier rules live in src/game/buildings.js planBuildOrUpgrade).
 // `castle` IS in the enum but only as an UPGRADE request: a fresh castle
-// can never be built (auto-founded on the first claim) — the catalog
-// refuses it with an agent-readable error.
+// can never be built (founded free on the first claim and by a court
+// relocation; a capture strips the tile of capital status, so no "capital
+// without a keep" is ever left to rebuild) — the catalog refuses it with an
+// agent-readable error. (This file ships in the public tree, so its
+// comments stay in English.)
 export const BuildRequestSchema = withPayloadAliases(z.object({
   territory_id: z.string().min(1),
   building_type: z.enum(['market', 'barracks', 'watchtower', 'walls', 'castle']),
