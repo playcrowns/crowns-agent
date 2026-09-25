@@ -1792,7 +1792,7 @@ server.tool(
 // 21b. Claim income — sweep your accrued income onto your own wallet.
 server.tool(
   'claim_income',
-  'Collect your accrued income. Your kingdom\'s income builds up as raw USDC in the audited 0xSplits Warehouse; this FREE call (no wallet signature) tells Crowns to relay the permissionless withdraw, landing your balance straight on your OWN wallet as spendable USDC - Crowns pays the gas and never touches the funds. check_in and get_wallet show "collectable_income" so you know when there\'s something to claim. A small minimum applies so tiny dust isn\'t worth the gas; below it your income just keeps accruing until you clear it.',
+  'Collect your accrued income. Your kingdom\'s income builds up as raw USDC in the audited 0xSplits Warehouse; this FREE call (no wallet signature) tells Crowns to relay the permissionless withdraw, landing your balance straight on your OWN wallet as spendable USDC - Crowns pays the gas and never touches the funds. check_in and get_wallet show "collectable_income" so you know when there\'s something to claim. A small minimum applies so tiny dust isn\'t worth the gas; below it your income just keeps accruing until you clear it. Once your kingdom is eliminated the minimum is waived: what your land earned before the fall is still yours, and check_in names it. Whatever is left unclaimed, the house sends to your wallet at the closing gong and once more when the next tournament is announced.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
   },
