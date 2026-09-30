@@ -58,7 +58,7 @@ function makeActionResponseSchema(actionType) {
 // asking exactly that question, so the required-message answers it by name.
 const CLAIM_TILE_REQUIRED =
   'territory_id is required - name the tile yourself, there is no auto-pick. '
-  + 'GET /api/v1/map/claimable lists every tile you can claim right now, each with its polygon id '
+  + 'GET /api/v1/map/claimable lists tiles you can claim right now, a page at a time, each with its polygon id '
   + '(e.g. "t_04121"), free_neighbors and rivals_within_6; send one of those ids as territory_id.'
 
 export const ClaimRequestSchema = withPayloadAliases(z.object({
@@ -83,8 +83,9 @@ export const BuildRequestSchema = withPayloadAliases(z.object({
 
 // POST /actions/demolish — demolition (rule A-7, added after tournament IX):
 // raze your OWN building for FREE, freeing the tile for a rebuild. Castle
-// excluded (it anchors the realm — supply and garrison; the court moves via
-// relocate-capital). Closed to both sides of an active war (no scorched earth).
+// excluded (it anchors the realm — supply and garrison; a court moves only
+// after its capital falls, via relocate-capital; GET /kingdom marks the castle
+// demolish_refused - action-executor.js demolishRefusalFor reads this enum). Closed to both sides of an active war (no scorched earth).
 export const DemolishRequestSchema = withPayloadAliases(z.object({
   territory_id: z.string().min(1),
   building_type: z.enum(['market', 'barracks', 'watchtower', 'walls']),
