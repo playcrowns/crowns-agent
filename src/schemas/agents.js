@@ -13,20 +13,24 @@ import { IsoTimestamp, UuidLoose } from './common.js'
 // ── POST /agents/register ──────────────────────────────────────────
 //
 // Final step of agent onboarding. Called by the agent (not human) with
-// its api_key. Flips the kingdom from 'pending' → 'active' and assigns
-// a color.
+// its api_key. Flips the kingdom from 'pending' → 'active'; the game
+// assigns the kingdom's colour (evenly across the palette) and it stays
+// with the kingdom for the whole tournament.
 //
 // Name length (2–50) is schema-enforced. Sanitizer still runs in the
-// handler for prompt-injection checks on both names. color_id is
-// optional — handler picks an unused palette slot if absent.
+// handler for prompt-injection checks on both names. color_id is still
+// accepted (old clients send it) and never used - the response's
+// color_note says so. Accepted means any value: a null, a string or a
+// number outside the palette must not turn registration into a 400 over
+// a field the server ignores.
 //
 // Heraldic emblems were removed entirely (2026-08-19, shipped with the
 // pre-reset bundle) - the canon is a diamond in the kingdom's colour.
-// Registration takes only kingdom name, ruler name, colour and manifesto.
+// Registration takes only kingdom name, ruler name and manifesto.
 export const RegisterRequestSchema = z.object({
   agent_name: z.string().trim().min(2, 'agent_name must be 2-50 characters').max(50, 'agent_name must be 2-50 characters'),
   kingdom_name: z.string().trim().min(2, 'kingdom_name must be 2-50 characters').max(50, 'kingdom_name must be 2-50 characters'),
-  color_id: z.number().int().nonnegative().optional(),
+  color_id: z.unknown().optional(),
   // W8: every kingdom is born speaking — the founding manifesto is
   // MANDATORY (force-voice pattern: the agent's voice IS the product).
   // It becomes the kingdom's first public statement in the Court.
@@ -47,14 +51,13 @@ export const SpendingLimitRequestSchema = z.object({
   daily_spend_limit_usd: z.number().finite(),
 })
 
-// ── POST /agents/change-color ──────────────────────────────────────
+// ── POST /agents/change-color — 410 tombstone ──────────────────────
 //
-// Change the kingdom's color. color_id must be a valid palette index;
-// handler enforces bounds against KINGDOM_PALETTE.length. Schema locks
-// shape only.
-export const ChangeColorRequestSchema = z.object({
-  color_id: z.number().int().nonnegative(),
-})
+// Kingdom colours are fixed for the whole tournament: the route answers
+// 410 with the rule to every call and validates no body (a bare POST
+// hears the rule, not a 400), so there is no request schema. The MCP
+// change_color tool is gone with the rule (a tool that only relays a
+// tombstone is tool-sprawl).
 
 // ── POST /agents/settings ──────────────────────────────────────────
 //
@@ -106,6 +109,8 @@ export const RegisterResponseSchema = z.strictObject({
   }),
   // W8: the mandatory founding manifesto's statement id (in the Court)
   founding_statement_id: z.string(),
+  // the colour the game assigned, in words (it is permanent for the tournament)
+  color_note: z.string(),
   next_step: z.string(),
   immunity_until: IsoTimestamp.nullable(),
 })
@@ -131,22 +136,11 @@ export const AgentMeResponseSchema = z.looseObject({
   name: z.string(),
 })
 
-// POST /agents/change-color — three branches: no-op (same color),
-// full change with palette hex echoed, or conflict (handled via 409
-// which lives outside this schema's 2xx branch).
-export const ChangeColorResponseSchema = z.union([
-  z.strictObject({
-    success: z.literal(true),
-    color_id: z.number(),
-    message: z.string(),
-  }),
-  z.strictObject({
-    success: z.literal(true),
-    color_id: z.number(),
-    color_hex: z.string(),
-    message: z.string(),
-  }),
-])
+// POST /agents/change-color — 410 tombstone shape (colours are fixed for
+// the tournament; there is no 2xx branch any more).
+export const ChangeColorResponseSchema = z.strictObject({
+  error: z.string(),
+})
 
 // GET /agents/settings — prompt + budget limits + today's spend breakdown
 // by category. spending_today values come from pg as strings (SUM over

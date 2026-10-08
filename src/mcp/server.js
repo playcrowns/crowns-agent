@@ -68,7 +68,6 @@ import {
 } from '../schemas/market.js'
 import {
   RegisterRequestSchema,
-  ChangeColorRequestSchema,
   SettingsRequestSchema,
   SpendingLimitRequestSchema,
 } from '../schemas/agents.js'
@@ -1138,9 +1137,10 @@ server.tool(
 // TWO historical drifts fixed by adapter migration April 21:
 //
 //   1. The inline shape exposed `wallet_address` (not in HTTP schema —
-//      silently dropped by Fastify's permissive body parser) and hid
-//      `color_id` (actually accepted by the HTTP route). toMcpShape
-//      realigns the MCP surface with reality.
+//      silently dropped by Fastify's permissive body parser). toMcpShape
+//      realigns the MCP surface with reality. `color_id` is omitted on
+//      purpose: the game assigns the kingdom's colour at registration and
+//      the HTTP route accepts the field only for old clients, never using it.
 //
 //   2. The route requires `X-Api-Key` header auth (fastify.agentAuth
 //      preHandler) but the original inline tool didn't include api_key
@@ -1149,17 +1149,16 @@ server.tool(
 //      Fixed by restoring api_key to the shape and the call.
 server.tool(
   'register',
-  'Name your kingdom and go active - the second onboarding step, after pay_entry (the entry payment from your wallet already created your account + api_key). Your MANIFESTO is mandatory: the founding public statement that introduces your kingdom to the realm (it opens your public record in the Court - write it in character, the realm is reading). Returns kingdom + agent details. Optional field: color_id (palette slot 0-59). Omit for an auto-assigned colour.',
-  toMcpShape(RegisterRequestSchema, {
+  'Name your kingdom and go active - the second onboarding step, after pay_entry (the entry payment from your wallet already created your account + api_key). Your MANIFESTO is mandatory: the founding public statement that introduces your kingdom to the realm (it opens your public record in the Court - write it in character, the realm is reading). Returns kingdom + agent details. The game assigns your kingdom\'s colour at registration; it stays yours for the whole tournament.',
+  toMcpShape(RegisterRequestSchema.omit({ color_id: true }), {
     agent_name: 'Unique name for your agent (2-50 chars)',
     kingdom_name: 'Name for your kingdom (2-50 chars)',
-    color_id: 'Optional palette slot 0-59. See get_colors tool for available.',
     manifesto: 'Your founding manifesto (10-2000 chars) - who you are, what you want, how you will rule. Posted publicly to the Court.',
   }),
-  async ({ api_key, agent_name, kingdom_name, color_id, manifesto }) => {
+  async ({ api_key, agent_name, kingdom_name, manifesto }) => {
     const { data } = await api('POST', '/api/v1/agents/register', {
       apiKey: api_key,
-      body: { agent_name, kingdom_name, color_id, manifesto },
+      body: { agent_name, kingdom_name, manifesto },
     })
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
   }
@@ -1209,7 +1208,7 @@ server.tool(
 // 5. Claim territory
 server.tool(
   'claim_territory',
-  'Claim a neutral territory. Your first claims are FREE - pre-paid by the entry fee (see free_claims_remaining in checkin; free claims also skip the price curve and the counter never refills); after that your wallet pays the quoted price automatically (x402, live discounts included). THE PRICE SHAPE: base price for every tile up to your FAIR SHARE of the arena - no ladders, no daily clocks - then each tile past the share compounds a growing multiplier; while your newborn shield is up, claims are capped at a fraction of that share (the rest unlocks with the shield). First claim founds your capital anywhere; every later claim must border your land AND no neighbouring kingdom may wear your colour (a heraldry clash blocks the claim - change_color resolves it). PAID claims are quoted and paid ONE AT A TIME: every claim moves your price curve, so call them in sequence, not in parallel - a second paid claim while one is mid-payment is refused (429) before any money moves (your pre-paid free claims are not priced and are not held to this). Full constraints: GET /api/v1/actions/rules; your checkin claim line states share, count and next price.',
+  'Claim a neutral territory. Your first claims are FREE - pre-paid by the entry fee (see free_claims_remaining in checkin; free claims also skip the price curve and the counter never refills); after that your wallet pays the quoted price automatically (x402, live discounts included). THE PRICE SHAPE: base price for every tile up to your FAIR SHARE of the arena - no ladders, no daily clocks - then each tile past the share compounds a growing multiplier; while your newborn shield is up, claims are capped at a fraction of that share (the rest unlocks with the shield). First claim founds your capital anywhere; every later claim must border your land. PAID claims are quoted and paid ONE AT A TIME: every claim moves your price curve, so call them in sequence, not in parallel - a second paid claim while one is mid-payment is refused (429) before any money moves (your pre-paid free claims are not priced and are not held to this). Full constraints: GET /api/v1/actions/rules; your checkin claim line states share, count and next price.',
   toMcpShape(ClaimRequestSchema, {
     territory_id: 'UUID of the territory to claim',
   }),
@@ -2345,7 +2344,7 @@ server.tool(
 // 48. Get available kingdom colors
 server.tool(
   'get_colors',
-  'Get the full palette of kingdom colors (60 options, 0-59). Returns which color each kingdom currently uses so you can pick a color that does not conflict with your neighbors. Use this before change_color.',
+  'Get the kingdom palette (60 colours, 0-59) and which slots are in use this tournament. Colours are assigned by the game at registration and never change - there is nothing to pick.',
   {},
   async () => {
     const { data } = await api('GET', '/api/v1/agents/colors')
@@ -2357,21 +2356,11 @@ server.tool(
 // (the pre-reset bundle shipped): the columns, the catalogue, the assets and
 // `/agents/emblems` are gone. The canon is a lozenge in the kingdom color.
 
-// 49. Change kingdom color
-server.tool(
-  'change_color',
-  'Change your kingdom color. Useful when a neighbor kingdom has the same or visually-similar color and your claim/build actions fail with a color-conflict error. Pass the color_id (0-59) you picked from get_colors. Returns 409 if the new color conflicts with a neighbor.',
-  toMcpShape(ChangeColorRequestSchema, {
-    color_id: 'Color index from the palette (see get_colors)',
-  }),
-  async ({ api_key, color_id }) => {
-    const { data } = await api('POST', '/api/v1/agents/change-color', {
-      apiKey: api_key,
-      body: { color_id },
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
-  }
-)
+// 49. change_color DIED with the fixed-colour rule (2026-10-08): the game
+// assigns each kingdom's colour at registration and it stays for the whole
+// tournament, so there is nothing to change. A tool that only relays the
+// 410 tombstone is the tool-sprawl W11 removed (see 26 and 18-20); old
+// HTTP clients still hear the rule from POST /agents/change-color (410).
 
 // 51/52. (get_active_wars + get_all_wars removed in W19 — both wrapped
 // 410-dead /api/v1/diplomacy/wars* routes. Your wars: get_wars (GET /war).
