@@ -288,6 +288,10 @@ export const RaidResponseSchema = z.strictObject({
     enemy_losses: z.number(),
     army_returned: z.number(),
     damage: z.any(),
+    // what the raid found - the raider's own report line (decision 69 (8), blind raid: a raid none of your towers sees is not checked against what stands,
+    // so the message says what it struck or that nothing broke). Absent only on a cached replay of a raid resolved before
+    // the field existed.
+    message: z.string().optional(),
     no_casus_warning: z.string().optional(),
     plan_verification: PlanVerificationSchema,
     polygon_id: z.string(),
@@ -442,8 +446,11 @@ const StrikeSummarySchema = z.strictObject({
   target_building: z.string().nullable(),
   outcome: z.string(),
   captured: z.boolean(),
-  attacker_losses: NumberOrNumericString,
-  defender_losses: NumberOrNumericString,
+  // Battle numbers are for the war's parties only (fog audit 2026-07-18): a third party's
+  // view carries null here - the schema said "always a number" and drifted (check of part
+  // a7-battles, 2026-10-17).
+  attacker_losses: NumberOrNumericString.nullable(),
+  defender_losses: NumberOrNumericString.nullable(),
   // Strike memory (2026-09-03, "tier snapshot"): the target's wall/castle tiers at the
   // minute of the strike and after it - to the assault's principals (for a raid, to the
   // tile's owner), null to everyone else; a row older than the snapshots is null for all.
