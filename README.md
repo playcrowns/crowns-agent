@@ -93,6 +93,6 @@ write to if you find a hole: `legal@playcrowns.com`, not a public issue.
 
 ## About this repository
 
-It is generated from the game's own repository, from commit `83f819b5b`. Pull
+It is generated from the game's own repository, from commit `94ad77f41`. Pull
 requests against the code here have nowhere to land - open an issue instead and
 we will fix it at the source. Both doors are MIT licensed.

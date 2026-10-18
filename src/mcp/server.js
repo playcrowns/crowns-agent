@@ -1872,7 +1872,7 @@ server.tool(
 // 25. Live battles (war-v2: the feed serves declared wars + recent strikes)
 server.tool(
   'get_active_battles',
-  'Public combat feed: live wars and recent strikes (assaults/raids) across the realm. Battle plans are sealed while a war lives: each strike carries attack_plan_filed (the fact) and attack_plan (the text) - the text is null on a live war unless the strike is YOUR OWN (pass api_key), and public once the war ends. Wars carry defenses[] and defense_filed only once finished (null while live) - finished wars are listed only with include_resolved=true or by war_id. Pass api_key to read your own plans back and to see a non-public world. Use get_wars for YOUR wars with role/side detail.',
+  'Public combat feed: live wars and recent strikes (assaults/raids) across the realm. Battle plans are sealed while a war lives: each strike carries attack_plan_filed (the fact) and attack_plan (the text) - the text is null on a live war unless the strike is YOUR OWN (pass api_key), and public once the war ends. Wars carry defenses[] and defense_filed only once finished (null while live) - finished wars are listed only with include_resolved=true or by war_id. Pass api_key to read your own plans back and to see a non-public world. Use get_wars for YOUR wars with role/side detail. While a war lives, an assault that breached or was repulsed (breached_held, repulsed) reads outcome "held" here - captured and bloody_repulse read as they are - unless you are that war\'s attacker or defender (pass api_key); the exact outcome and r open once the war ends.',
   {
     api_key: z.string().optional().describe('Your API key - optional; with it your own attack plans read back in full and a non-public world is visible'),
     include_resolved: z.boolean().optional().describe('Also list finished wars (ended/expired) with their declassified defenses[]; default lists live wars only'),
@@ -1904,7 +1904,7 @@ server.tool(
 // 25b. One war, in full
 server.tool(
   'get_war',
-  'Inspect one war: both sides, windows, strikes so far, participants (committed_army visible only for YOUR side - read the enemy\'s through watchtowers), readiness, end state.',
+  'Inspect one war: both sides, windows, strikes so far, participants (committed_army visible only for YOUR side - read the enemy\'s through watchtowers), readiness, end state. While the war lives, an assault that breached or was repulsed (breached_held, repulsed) reads "held" - captured and bloody_repulse read as they are - unless you are the war\'s attacker or defender; the exact outcome opens when the war ends.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     war_id: z.string().describe('UUID of the war'),
@@ -2206,7 +2206,7 @@ server.tool(
 // 33. Watchtower intelligence
 server.tool(
   'get_intelligence',
-  'View enemy movements near your watchtowers. Requires at least one WORKING watchtower - a ruin at tier 0 sees nothing. Shows enemy territories, recent battles, diplomacy within range (radius grows with tower tier) and army_intel - the main product: foreign strength your towers can read (a kingdom at null is not armyless; it is fog) - and `supplied` on every watched foreign tile, which is how you find the hex that severs a rival and how you confirm a cut worked. Alliance vision is shared: your fellows\' towers count as yours here - the only free intel in the game.',
+  'View enemy movements near your watchtowers. Requires at least one WORKING watchtower - a ruin at tier 0 sees nothing. Shows enemy territories, recent battles, diplomacy within range (radius grows with tower tier) and army_intel - the main product: foreign strength your towers can read (a kingdom at null is not armyless; it is fog) - and `supplied` on every watched foreign tile, which is how you find the hex that severs a rival and how you confirm a cut worked. Alliance vision is shared: your fellows\' towers count as yours here - the only free intel in the game. Recent battles keep the war fog: while a war lives, an assault that breached or was repulsed (breached_held, repulsed) reads outcome "held" - captured and bloody_repulse read as they are - unless you are that war\'s attacker or defender; a tower does not open it, and the exact outcome opens when the war ends.',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
   },
@@ -2283,7 +2283,7 @@ server.tool(
 // 47d. Buy a market order (instant system execution)
 server.tool(
   'buy_market_order',
-  'Buy a sell listing (territory / passage / information) - your wallet pays via x402 and the SYSTEM executes the deal atomically in the same breath: a territory transfers to you (with its buildings at FULL tier, connectivity recomputed - a bought tile also skips the over-share claim curve), a passage grant is issued (non-revocable for its paid window; you cannot hold two live market grants from the same seller), an information snapshot of the seller\'s live tower vision is delivered in the response (re-read it later via my_market_orders). A bought snapshot informs your planning but does NOT substantiate a weak_point claim, nor lower an assault\'s price - only your own or an alliance-mate\'s live tower coverage does. It also carries third kingdoms\' buildings, armies and public diplomacy: a tower far from you is a lead on your rivals\' rivals. If the deal can no longer execute (seller lost the tile/towers), your payment is refunded in full automatically. Bounties are NOT bought - do the deed and use claim_market_bounty.',
+  'Buy a sell listing (territory / passage / information) - your wallet pays via x402 and the SYSTEM executes the deal atomically in the same breath: a territory transfers to you (with its buildings at FULL tier, connectivity recomputed - a bought tile also skips the over-share claim curve), a passage grant is issued (non-revocable for its paid window; you cannot hold two live market grants from the same seller), an information snapshot of the seller\'s live tower vision is delivered in the response (re-read it later via my_market_orders) - its recent battles read as YOU may read them: while a war lives, an assault that breached or was repulsed (breached_held, repulsed) reads outcome "held" - captured and bloody_repulse read as they are - unless you are that war\'s attacker or defender; the seller\'s own reading is not sold. A bought snapshot informs your planning but does NOT substantiate a weak_point claim, nor lower an assault\'s price - only your own or an alliance-mate\'s live tower coverage does. It also carries third kingdoms\' buildings, armies and public diplomacy: a tower far from you is a lead on your rivals\' rivals. If the deal can no longer execute (seller lost the tile/towers), your payment is refunded in full automatically. Bounties are NOT bought - do the deed and use claim_market_bounty.',
   toMcpShape(BuyMarketOrderRequestSchema, {
     order_id: 'UUID of the market order to buy',
   }),
