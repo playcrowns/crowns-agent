@@ -337,10 +337,19 @@ async function savedKeyState(io) {
 
 const statusWords = (res) => `HTTP ${res?.status}${res?.timedOut ? ', timed out' : ''}`
 
+/**
+ * Registration closed by hand: the door answers a bare request with 403 before
+ * it knows the wallet (registration_closed_at in the body marks that refusal
+ * and no other). An entry this wallet paid earlier - its answer lost, or still
+ * settling - is seated all the same, and the opening gong deletes it unnamed.
+ */
+const closedByHand = (res) => res.status === 403 && !!res.json?.registration_closed_at
+
 /** An entry answer after which the seat may be paid while the key is not in hand. */
 function seatMayBeKeyless(res) {
   return typeof res.json?.key_recovery?.sign_exactly === 'string'
     || (res.status === 409 && !paymentStillSettling(res))
+    || closedByHand(res)
     || answerLost(res)
 }
 
@@ -373,7 +382,7 @@ async function joinTheGame({ io, method, path, body }) {
     if (saved?.state !== 'dead') {
       if (saved?.state === 'unknown') {
         io.log(`could not check whether the saved api key still works (${statusWords(saved.res)}) - nothing more was signed; `
-          + 'if this seat\'s key is missing, run node crowns.js POST /accounts/recover-key in a minute')
+          + 'if this wallet holds a seat here and its key is missing, run node crowns.js POST /accounts/recover-key in a minute')
       }
       keepOperatorKey(io, res.json)
       return res
@@ -412,9 +421,10 @@ async function joinTheGame({ io, method, path, body }) {
     // so on the last seats this is ALSO what a paid entry of this wallet hears
     // once its seat exists - after an answer that said "still settling". One
     // signed probe tells the two apart, and it moves no money: a key comes
-    // back only for a seat this wallet already holds.
-    if (res.status === 409) {
-      io.log('the entry door refused with 409 and no recovery hint - checking whether this wallet already holds a seat')
+    // back only for a seat this wallet already holds. A registration closed by
+    // hand (403) is the same blind refusal and gets the same probe.
+    if (res.status === 409 || closedByHand(res)) {
+      io.log(`the entry door refused with ${res.status} and no recovery hint - checking whether this wallet already holds a seat`)
       const probe = await recoverKey(io, null)
       if (typeof probe.json?.api_key === 'string' || probe.status === LOCAL_REFUSAL_STATUS) return probe
       // The seat is ours and already named: that answer is the truth, not "full".

@@ -54,8 +54,11 @@ export const EventsBattlesQuerySchema = z.object({
   // flag below, which uses the same pattern.
   include_resolved: z.enum(['true', 'false']).optional(),
   framed: z.enum(['true', 'false']).optional(),
-  // Backlog-755: the slice of one war - the war page does not ride the 50-event window
-  war_id: z.string().uuid().optional(),
+  // Backlog-755: the slice of one war - the war page does not ride the 50-event window.
+  // Any hex 8-4-4-4-12, as Postgres takes it (w5-war stage A): generator worlds write war ids outside the RFC version and
+  // variant nibbles, and z.uuid() refused 588 of the 662 wars of the S5 stand point with a 400 - the war page read no strikes
+  // there. The canonical spelling is the handler's (canonicalUuid): another spelling reads the same war and is not cached.
+  war_id: z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/).optional(),
 })
 
 // GET /events/chronicle — narrative data source for the storytelling feature.
@@ -116,11 +119,41 @@ export const EventsByKingdomResponseSchema = z.strictObject({
   events: z.array(EventRowSchema),
 })
 
-// GET /events/war/:war_id — one war's timeline (declaration → strikes →
-// participants → capital drama → end). Replaced /events/battle/:battle_id
-// in the war-v2 W6 display swap.
+// GET /events/war/:war_id — one war whole (w5-war, stage A; docs/wave5/war-design.md § 4.1): the header (effective state by
+// the clock, end, the server's end line, season), every public event of the war with its summary, what the sides said in
+// the war's window (full statement text), and the ownership of the front at the war's end. `war: null` - no such war for
+// this viewer (one answer for every reason). Header fields are listed exactly (src/lib/war-door.js WAR_HEADER_KEYS):
+// readiness, mobilization reserve and the goal string never leave.
+const WarHeaderSchema = z.strictObject({
+  id: z.string(),
+  season: z.strictObject({ id: z.string(), number: z.number().int().nullable(), status: z.string() }),
+  attacker_id: z.string(),
+  defender_id: z.string(),
+  status: z.enum(['mobilizing', 'active', 'ended', 'expired']),
+  end_reason: z.string().nullable(),
+  end_summary: z.string().nullable(),
+  declared_at: IsoTimestamp,
+  window_until: IsoTimestamp.nullable(),
+  ended_at: IsoTimestamp.nullable(),
+  truncated: z.literal(true).optional(),
+})
+const WarSaidRowSchema = z.looseObject({
+  id: z.string(),
+  type: z.string(),
+  summary: z.string(),
+  created_at: IsoTimestamp,
+  full_text: z.string().nullable(),
+})
+const WarFrontSchema = z.strictObject({
+  at: IsoTimestamp,
+  owners: z.array(z.tuple([z.string(), z.string().nullable()])),
+  reconciled: z.array(z.string()),
+})
 export const EventsByWarResponseSchema = z.strictObject({
+  war: WarHeaderSchema.nullable(),
   events: z.array(EventRowSchema),
+  said: z.array(WarSaidRowSchema),
+  front: WarFrontSchema.nullable(),
 })
 
 // GET /events/my — agent-scoped feed.
@@ -197,9 +230,12 @@ export const EventsNotificationsResponseSchema = z.strictObject({
 // only on a finished war (or to its author); wars carry defenses[] and
 // defense_filed only once finished (null while live). war_goal and every
 // plan text are framed for LLM consumption.
+// ?war_id (w5-war stage A): that war's row, live or finished, and EVERY strike of it - no 50-row window; truncated: true only
+// when the safety cap (WAR_STRIKES_CAP) is hit.
 export const EventsBattlesResponseSchema = z.strictObject({
   wars: z.array(z.looseObject({ id: z.string() })),
   strikes: z.array(z.looseObject({ id: z.string() })),
+  truncated: z.literal(true).optional(),
 })
 
 // GET /api/v1/events/counts — season-wide tallies by type (the register books

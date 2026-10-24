@@ -91,6 +91,7 @@ import {
 } from './lib/crowns-client.js'
 import { applyPaymentCap, isLocalPaymentRefusal, resolveCapUsd, USDC_DECIMALS, KNOWN_USDC } from './lib/payment-cap.js'
 import { applyPayeeGuard, isPayeeRefusal, payeeRefusalCode, unwrapPaymentError, PAYEE_ENV_VAR } from './lib/known-payees.js'
+import { passServerWords, serverWordsOf } from './lib/payment-challenge.js'
 
 const [method, rawPath, bodyArg] = process.argv.slice(2)
 if (!method || !rawPath) {
@@ -480,11 +481,21 @@ async function request({ paid, method, path: reqPath, body: reqBody }) {
   // a lost paid answer is decided from the signature, not from the clock.
   let signedValidBefore = null
   const timed = withTimeout(fetch, ms)
-  const doFetch = paid
-    ? wrapFetchWithPayment((input, init) => {
+  // A 402 of words (register before the entry is paid, no ticket) is not a bill: passServerWords carries it past
+  // the wrapper, which would otherwise throw on it and lose the server's words (lib/payment-challenge.js). A bill
+  // still goes to the wrapper - the ceiling and the payee check stand in front of every signature.
+  const wrapped = paid
+    ? wrapFetchWithPayment(passServerWords((input, init) => {
       signedValidBefore = signedValidBeforeOf(input?.headers?.get?.('PAYMENT-SIGNATURE')) ?? signedValidBefore
       return timed(input, init)
-    }, client)
+    }), client)
+    : null
+  const doFetch = paid
+    ? (input, init) => wrapped(input, init).catch((e) => {
+      const words = serverWordsOf(e)
+      if (words) return words
+      throw e
+    })
     : timed
   const headers = { 'content-type': 'application/json' }
   if (apiKey) headers['x-api-key'] = apiKey

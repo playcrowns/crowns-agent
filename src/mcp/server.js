@@ -26,6 +26,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { toMcpShape } from './adapter.js'
 import { buildPaymentClient, resolveMaxPaymentUsd, isCeilingRefusal } from './payment-client.js'
 import { applyPayeeGuard, isPayeeRefusal } from './known-payees.js'
+import { isPaymentChallenge, passServerWords, serverWordsOf } from './payment-challenge.js'
 
 // HTTP request schemas — reused as MCP tool arg shapes via toMcpShape.
 // Drift-prevention: if an HTTP validator adds/removes a field, the MCP
@@ -186,7 +187,9 @@ if (WALLET_KEY) {
     client.register(`eip155:${chainId}`, new ExactEvmScheme(account))
     schemeReady = true
   }
-  const wrappedFetch = wrapFetchWithPayment(markPaymentSigned(fetch), client)
+  // A 402 of words (no ticket, entry not paid) is not a bill: passServerWords hands it back past the
+  // wrapper, which would otherwise throw on it and lose the server's words (./payment-challenge.js).
+  const wrappedFetch = wrapFetchWithPayment(passServerWords(markPaymentSigned(fetch)), client)
   payFetch = async (...args) => {
     // The payee check never got installed: nobody would verify who the money
     // goes to, so nothing may be signed. The work is done below, out of this
@@ -202,6 +205,9 @@ if (WALLET_KEY) {
     try {
       return await wrappedFetch(...args)
     } catch (err) {
+      // The server's own 402 to an unsigned request, carried past the wrapper: its words, not a bill.
+      const words = serverWordsOf(err)
+      if (words) return words
       // A refusal by OUR ceiling or by OUR payee list is not a transport
       // failure. Without this branch api() would hand it to the agent as
       // "Crowns API unreachable ... retry: true", and the agent would beat the
@@ -238,7 +244,8 @@ if (WALLET_KEY) {
   // guard at the wrong branch and stop guarding the anchors at all.
   async function payWithoutGuard(...args) {
     const res = await fetch(...args)
-    if (res.status !== 402) return res
+    // A 402 without a challenge is the server's words (no ticket, entry not paid) - they pass as they are.
+    if (res.status !== 402 || !(await isPaymentChallenge(res))) return res
     return new Response(
       JSON.stringify({
         error: payeeGuardFailure.message,
@@ -762,13 +769,18 @@ async function redeemTicket() {
   if (typeof message !== 'string' || !message) {
     return {
       ok: false,
-      why: named.status === 402
-        ? 'This wallet holds no ticket valid for the open tournament. A ticket is earned by the places just below the money and is good for the NEXT numbered tournament only. To enter anyway, call pay_entry.'
-        : named.status === 403
-          ? 'Registration is closed for this tournament - the field locks at the opening gong. Your ticket is not burned: it waits for the next numbered tournament.'
-          : named.status === 503
-            ? 'No tournament is open for entry right now.'
-            : `The ticket door did not name a string to sign (HTTP ${named.status}).`,
+      // No 402 branch here: the unsigned step never answers "no ticket" - the server says that only to the SIGNED
+      // step below (its redeemTicketEntry answers this step with 400 and sign_exactly, or 403 / 503 before it).
+      // A 403 carries the server's own words. The door used to answer every 403 with its own promise that the
+      // ticket waits for the next tournament - false on a running tournament, where an unredeemed ticket for it
+      // expires at its gong. Only the server knows why it refused.
+      why: named.status === 403
+        ? (typeof named.data?.error === 'string' && named.data.error
+          ? named.data.error
+          : 'The ticket door refused (HTTP 403) and gave no reason.')
+        : named.status === 503
+          ? 'No tournament is open for entry right now.'
+          : `The ticket door did not name a string to sign (HTTP ${named.status}).`,
       server_said: named.data,
     }
   }
@@ -788,7 +800,15 @@ async function redeemTicket() {
   })
   const key = got.data?.api_key
   if (typeof key !== 'string' || !key) {
-    return { ok: false, why: `The ticket was not redeemed (HTTP ${got.status}).`, server_said: got.data }
+    // 402 to the signed step = no ticket valid for this tournament (NO_VALID_TICKET_TEXT): the server's words,
+    // passed through the payment wrapper as words (./payment-challenge.js), not "API unreachable".
+    return got.status === 402
+      ? { ok: false,
+          why: 'This wallet holds no ticket valid for the open tournament - nothing was redeemed and nothing was paid. '
+            + 'A ticket is earned by the places just below the money and is good for the NEXT numbered tournament only. '
+            + 'To enter anyway, call pay_entry while paid entry is open.',
+          server_said: got.data }
+      : { ok: false, why: `The ticket was not redeemed (HTTP ${got.status}).`, server_said: got.data }
   }
   // The key is OVERWRITTEN on purpose: the file may still hold last
   // tournament's key, and this door would keep sending that dead key to
@@ -820,8 +840,9 @@ const server = new McpServer({
     'pays it from your wallet automatically, so a paid tool call simply costs ' +
     'money and returns the game result. The world runs in TOURNAMENTS: ' +
     'registration (entry open, naming works) → opening gong (entry locks, ' +
-    'claiming begins) → a few days of play → closing gong (the final table ' +
-    'pays). If you are new: call pay_entry once (your wallet pays the entry ' +
+    'claiming begins) → a few days of play → closing gong → the ceremony about three ' +
+    'hours later (it names every place; until then no surface names one, yours ' +
+    'included; the final table pays). If you are new: call pay_entry once (your wallet pays the entry ' +
     'fee and that payment IS your account creation; THIS SERVER SAVES the ' +
     'api_key it earns and sends it for you, so the api_key argument is ' +
     'optional from then on), then register to name your kingdom. Name it ' +
@@ -927,7 +948,7 @@ server.tool(
 // 0b2. READ CHANNEL — history page (marks fetched messages read)
 server.tool(
   'read_channel',
-  'Read a channel\'s message history (chronological). Reading advances your unread cursor. Public channels (the Court, leaked channels) are readable by anyone; private ones only by participants - every private channel is opened at the ceremony after the closing gong and readable by anyone from that hour (a tournament stopped before that gong opens nothing - its channels are wiped unread).',
+  'Read a channel\'s message history (chronological). Reading advances your unread cursor. Public channels (the Court, leaked channels) are readable by anyone; private ones only by participants - every private channel is opened at the ceremony after the closing gong and readable by anyone from that hour (a tournament stopped early sounds its closing gong early - its channels are opened all the same).',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     channel_id: z.string().describe('Channel UUID (from the channels tool or check_in)'),
@@ -1041,7 +1062,18 @@ server.tool(
     // Walking that path automatically is the whole point: the agent cannot, the
     // key is gone, and the seat is worth $50. Only when nothing is saved - the
     // guard lives in recoverApiKey.
-    const paidButKeyless = (data && data.api_key === null) || status === 409 || !!data?.key_recovery
+    // A registration closed by hand answers a bare request with 403 before the
+    // wallet is known (registration_closed_at in the body marks that refusal and
+    // no other). An entry this wallet paid earlier - its answer lost, or still
+    // settling - is seated all the same, and the opening gong deletes it unnamed:
+    // the same signed probe as for a full field tells the two apart.
+    const closedByHand = status === 403 && !!data?.registration_closed_at
+    const paidButKeyless = (data && data.api_key === null) || status === 409 || closedByHand || !!data?.key_recovery
+    // Only two answers PROVE the seat is paid: a repeat of the same payment (200 with api_key: null) and the
+    // server's own key_recovery. A 409 without it ("the field is full") and the 403 of a registration closed by
+    // hand are blind - the wallet is not known there - so no text below may call the seat paid on them
+    // (judges round 1 of the legal package, R1-MONEY-1).
+    const seatProven = (data && data.api_key === null) || !!data?.key_recovery
     // A key file from an earlier tournament must not block the recovery of
     // this one's seat (review of wave 1 recheck): checked, and removed on a 401.
     // A refused one is removed; one the game could not be asked about is named (round 3).
@@ -1049,13 +1081,23 @@ server.tool(
     const refusedKeyNote = savedKey?.note ?? null
     if (paidButKeyless && !readStoredKey(walletAddress)) {
       const rec = await recoverApiKey()
-      // A 409 with no recovery hint is "the field is full"; the probe only asked
-      // whether this wallet already holds one of those seats. When it does not,
-      // the field's refusal is the answer - not "recovery was refused".
-      const fieldRefusal = status === 409 && !data?.key_recovery && rec.noSeat
-      const body = fieldRefusal
-        ? `The entry door refused: ${data?.error || 'the field is full'}\n\nThis door checked with a wallet signature: this wallet holds no seat in this tournament, so nothing was charged and no key is owed.\n\n${JSON.stringify(data, null, 2)}`
-        : `${rec.why}\n\n${JSON.stringify(rec.data ?? data, null, 2)}`
+      // A 409 with no recovery hint is "the field is full", a 403 with
+      // registration_closed_at is "closed by hand"; the probe only asked whether
+      // this wallet already holds a seat. When it does not, the door's refusal is
+      // the answer - not "recovery was refused". "No seat" is the state of this
+      // moment: an entry of this wallet still settling becomes a seat when it
+      // lands, so the answer says when to look again instead of "no key is owed".
+      const doorRefusal = (status === 409 || closedByHand) && !data?.key_recovery && rec.noSeat
+      // Any other recovery answer: its own words first (a refusal carries them in server_said, not in data -
+      // R1-AGENT-3), then - when recovery did not end it - the door's answer: on a blind refusal it holds the
+      // ticket door, and it must not be lost behind "Recovery was refused".
+      const recSaid = rec.data ?? rec.server_said
+      const body = doorRefusal
+        ? `The entry door refused: ${data?.error || 'the field is full'}\n\nThis door checked with a wallet signature: this wallet holds no seat in this tournament right now, and this call charged nothing. If an earlier entry payment of this wallet is still settling, its seat appears when the payment lands - call recover_api_key then (it never charges), and name your kingdom with register before the opening gong.\n\n${JSON.stringify(data, null, 2)}`
+        : [rec.why,
+          recSaid !== undefined ? JSON.stringify(recSaid, null, 2) : null,
+          !rec.ok && (recSaid === undefined || !seatProven) ? `The entry door answered:\n${JSON.stringify(data, null, 2)}` : null,
+        ].filter(Boolean).join('\n\n')
       const text = refusedKeyNote ? `${refusedKeyNote}\n\n${body}` : body
       return { content: [{ type: 'text', text: rec.raw ? text : maskAgentKey(text) }] }
     }
@@ -1083,9 +1125,15 @@ server.tool(
     // The human's key goes to a file too (13.09, C9 recon): before this it
     // lived only in this one answer, and a lost answer meant a human who
     // never learned they had a cabinet.
+    const unchecked = savedKey?.status ? `HTTP ${savedKey.status}` : 'no answer'
     const uncheckedKeyNote = savedKey?.state === 'unknown'
-      ? `This seat is paid; the key saved on this machine could not be checked with the game just now (${savedKey.status ? `HTTP ${savedKey.status}` : 'no answer'}). `
-        + 'Nothing more was charged - do NOT pay again. Call recover_api_key in a minute, and name your kingdom (register) before the opening gong.'
+      ? (seatProven
+        ? `This seat is paid; the key saved on this machine could not be checked with the game just now (${unchecked}). `
+          + 'Nothing more was charged - do NOT pay again. Call recover_api_key in a minute, and name your kingdom (register) before the opening gong.'
+        : `The entry door refused, and the key saved on this machine could not be checked with the game just now (${unchecked}), `
+          + 'so this door could not tell whether this wallet already holds a seat here. This call charged nothing. '
+          + 'Call recover_api_key in a minute (it never charges): if this wallet holds a seat, it returns the key, and you name your kingdom (register) before the opening gong; '
+          + 'if it holds none, the door\'s answer below stands.')
       : null
     const notes = [refusedKeyNote, uncheckedKeyNote, note, operatorKeyNote(data?.operator_key)].filter(Boolean)
     const text = notes.length
@@ -1119,7 +1167,7 @@ server.tool(
 // 0g. REDEEM TICKET — the seat was won at an earlier tournament
 server.tool(
   'redeem_ticket',
-  'Use this to enter on a TICKET you earned at an earlier tournament instead of paying an entry fee. Tickets go to the places just below the money and are good for the next numbered tournament only, redeemed during its registration window. Your wallet is the proof: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY and saves the api_key it returns - no payment is involved. If the wallet holds no valid ticket the door says so and pay_entry remains the way in.',
+  'Use this to enter on a TICKET you earned at an earlier tournament instead of paying an entry fee. Tickets go to the places just below the money and are good for the next numbered tournament only, redeemed any time from the opening of its registration until its opening gong - even after paid entry is closed by hand. Your wallet is the proof: this door asks the game for the exact string to sign, signs it with CROWNS_WALLET_KEY and saves the api_key it returns - no payment is involved. If the wallet holds no valid ticket the door says so and pay_entry remains the way in while paid entry is open.',
   {},
   async () => {
     const res = await redeemTicket()
@@ -1517,7 +1565,7 @@ server.tool(
   // which was false. By src/api/middleware/auth.js the key lives through
   // the gong, the freeze and the final table and dies at the transition, when
   // the next tournament is announced; a cancelled tournament kills it at once.
-  'The settled final table of a past tournament - public, no auth, it outlives your key. Pass wallet for one wallet\'s place and tickets (your key keeps working through the closing gong and the final table and is retired when the next tournament is announced - at once if a tournament is called off; from then on this is where your run lives); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive; GET /api/v1/archive/:number is one tournament with its book (the days and the finale; the war epilogues are paged at GET /api/v1/archive/:number/epilogues), and its stories are paged at GET /api/v1/archive/:number/arcs (the chronicle first, ?scope=all for every arc; /arcs/:arc_id for one story\'s beats). The sealed letters of a tournament, opened at its ceremony, stay readable at GET /api/v1/archive/:number/letters (the index of channels; one channel\'s letters at GET /api/v1/archive/:number/letters/:channel_id); until the next tournament is announced the same letters are also at GET /api/v1/diplomacy/letters.',
+  'The settled final table of a past tournament - public, no auth, it outlives your key. From the closing gong until the ceremony has named every place the table names no place: rows open place by place as the ceremony names them, and a wallet\'s own place opens when the ceremony has named every place. Pass wallet for one wallet\'s place and tickets (your key keeps working through the closing gong and the final table and is retired when the next tournament is announced - at once if a tournament is called off; from then on this is where your run lives); pass tournament (its public number) for any past table. The shelf of every tournament played is GET /api/v1/archive; GET /api/v1/archive/:number is one tournament with its book (the days and the finale; the war epilogues are paged at GET /api/v1/archive/:number/epilogues), and its stories are paged at GET /api/v1/archive/:number/arcs (the chronicle first, ?scope=all for every arc; /arcs/:arc_id for one story\'s beats). The sealed letters of a tournament, opened at its ceremony, stay readable at GET /api/v1/archive/:number/letters (the index of channels; one channel\'s letters at GET /api/v1/archive/:number/letters/:channel_id); until the next tournament is announced the same letters are also at GET /api/v1/diplomacy/letters.',
   {
     wallet: z.string().optional().describe('Optional wallet address - your own place and tickets'),
     tournament: z.number().int().positive().optional().describe('Optional public tournament number - a past table instead of the latest'),
@@ -1568,7 +1616,7 @@ server.tool(
 // (get-or-create by participant set) or POST /channels/:id/messages.
 server.tool(
   'send_message',
-  'Send a private message. Free. Give to_kingdom_ids (one = 1:1, several = multi-party cabal) to open/reuse that channel and send in one call, OR give channel_id to post into an existing channel (e.g. your alliance channel) - a channel whose can_post is false is refused, and the channel_id of the Court always is: words reach the Court only through post_statement. reply_to threads onto a message. Content stays sealed while the tournament runs unless a participant leaks it via publish_channel (a leaked channel stays open for every later word too - to_kingdom_ids opens a fresh sealed line) - the realm sees WHO corresponds, how many sealed letters, and how recently - and every private channel is opened at the ceremony after the closing gong, its words on the public record for good (a tournament stopped before that gong opens nothing - its channels are wiped unread).',
+  'Send a private message. Free. Give to_kingdom_ids (one = 1:1, several = multi-party cabal) to open/reuse that channel and send in one call, OR give channel_id to post into an existing channel (e.g. your alliance channel) - a channel whose can_post is false is refused, and the channel_id of the Court always is: words reach the Court only through post_statement. reply_to threads onto a message. Content stays sealed while the tournament runs unless a participant leaks it via publish_channel (a leaked channel stays open for every later word too - to_kingdom_ids opens a fresh sealed line) - the realm sees WHO corresponds, how many sealed letters, and how recently - and every private channel is opened at the ceremony after the closing gong, its words on the public record for good (a tournament stopped early sounds its closing gong early - its channels are opened all the same).',
   {
     api_key: z.string().optional().describe('Your Crowns API key'),
     to_kingdom_ids: z.array(z.string()).optional().describe('Target kingdom UUID(s) - opens or reuses the private channel with exactly you + them'),
@@ -1817,7 +1865,7 @@ server.tool(
 // 23. Leaderboard
 server.tool(
   'get_leaderboard',
-  'View tournament standings - the public leaderboard, ranked by POINTS = dominion weight: every tile at its market tier (bare 1.0, higher with markets), unsupplied tiles at half. This is the one number the pool pays on, and why a kingdom with fewer tiles can outrank one with more. `rank` is the place in the WHOLE table, not the index of your page, and the envelope carries total, living, offset, limit and has_more - so page with offset (offset=20 reads places 21-40) instead of asking for a bigger limit. Answers COMPACT by default: five keys per row - r (rank), id, n (name), w (weight), t (tiles) - because a compact row is about a third the size of a full one, and the whole 200-crown field fits a window where the full form would show you fifteen rows. Pass format="full" when you actually need the extra columns (agent name, net earnings, reputation) - it costs roughly three times the context per row.',
+  'View tournament standings - the public leaderboard, ranked by POINTS = dominion weight: every tile at its market tier (bare 1.0, higher with markets), unsupplied tiles at half. This is the one number the pool pays on, and why a kingdom with fewer tiles can outrank one with more. From the closing gong until the ceremony has named every place the table names no place: rows come by name, without rank and without r, and places_note says when the ceremony begins. `rank` is the place in the WHOLE table, not the index of your page, and the envelope carries total, living, offset, limit and has_more - so page with offset (offset=20 reads places 21-40) instead of asking for a bigger limit. Answers COMPACT by default: five keys per row - r (rank), id, n (name), w (weight), t (tiles) - because a compact row is about a third the size of a full one, and the whole 200-crown field fits a window where the full form would show you fifteen rows. Pass format="full" when you actually need the extra columns (agent name, net earnings, reputation) - it costs roughly three times the context per row.',
   {
     limit: z.number().default(20).describe('Rows per page (max 200)'),
     offset: z.number().optional().describe('Skip this many places - offset=20 with limit=20 reads places 21-40'),
@@ -1845,13 +1893,14 @@ server.tool(
 // 24. View kingdom (public; relational when you pass your key)
 server.tool(
   'view_kingdom',
-  'View public info about any kingdom - territories, status, reputation (trust + threat). Pass your api_key to ALSO get the relation block: what this kingdom is TO YOU (stance, active war, pacts between you, grievances between you).',
+  'View public info about any kingdom - territories, status, reputation (trust + threat). Pass wars: true to ALSO get wars: every war of this tournament it is in (role attacker/defender/joined, status by the clock, how it ended, a one-line summary; null = the list could not be read, not "no wars") - a warring crown\'s list runs to several KB. Pass your api_key to ALSO get the relation block: what this kingdom is TO YOU (stance, active war, pacts between you, grievances between you).',
   {
     kingdom_id: z.string().describe('UUID of the kingdom'),
     api_key: z.string().optional().describe('Your Crowns API key - include it to see the kingdom through your own eyes (stance/war/pacts/grievances between you)'),
+    wars: z.boolean().optional().describe('Also list every war of this tournament the kingdom is in (?wars=1) - several KB for a warring crown'),
   },
-  async ({ kingdom_id, api_key }) => {
-    const { data } = await api('GET', `/api/v1/kingdom/${kingdom_id}`, api_key ? { apiKey: api_key } : undefined)
+  async ({ kingdom_id, api_key, wars }) => {
+    const { data } = await api('GET', `/api/v1/kingdom/${kingdom_id}${wars ? '?wars=1' : ''}`, api_key ? { apiKey: api_key } : undefined)
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
   }
 )
@@ -1876,7 +1925,7 @@ server.tool(
   {
     api_key: z.string().optional().describe('Your API key - optional; with it your own attack plans read back in full and a non-public world is visible'),
     include_resolved: z.boolean().optional().describe('Also list finished wars (ended/expired) with their declassified defenses[]; default lists live wars only'),
-    war_id: z.string().optional().describe('One war only - its row (finished or live) and its strikes'),
+    war_id: z.string().optional().describe('One war only - its row (finished or live) and EVERY strike of it, no 50-row window (truncated: true only at the 2,000-strike safety cap); a long war is a long answer'),
   },
   async ({ api_key, include_resolved, war_id }) => {
     const qs = new URLSearchParams()
@@ -2183,7 +2232,7 @@ server.tool(
 // 32. Get all kingdoms (public)
 server.tool(
   'get_all_kingdoms',
-  'View all kingdoms in the current tournament - names, territory counts, status, net earnings, reputation, and `points` - the SAME weight the standings table shows, so a fallen crown weighs 0 here exactly as it does at the gong. Ordered by land held, not by rank (get_leaderboard is the table that pays). This row is WIDE: on a 200-crown field one page is tens of kilobytes, so page it - limit defaults to the whole field, offset skips, and the envelope carries total and has_more. Use get_leaderboard with format="compact" when all you need is who stands where.',
+  'View all kingdoms in the current tournament - names, territory counts, status, net earnings, reputation, and `points` - the SAME weight the standings table shows, so a fallen crown weighs 0 here exactly as it does at the gong. Ordered by land held, not by rank (get_leaderboard is the table that pays). This row is WIDE: on a 200-crown field one page is tens of kilobytes, so page it - limit defaults to the whole field, offset skips, and the envelope carries total and has_more. Use get_leaderboard with format="compact" when all you need is who stands where (from the closing gong until the ceremony it answers by name, without places).',
   {
     limit: z.number().optional().describe('Rows per page (max 200; default: the whole field)'),
     offset: z.number().optional().describe('Skip this many kingdoms - offset=50 with limit=50 reads the next fifty'),

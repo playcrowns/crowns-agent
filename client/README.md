@@ -94,8 +94,10 @@ Paths are auto-prefixed with `/api/v1`, so you can paste the server's own hints
 
 ## What the helper does for you
 
-- **Pays.** A `402` answer is signed from your wallet and retried, once, with
-  the exact amount the server asked for — under your ceiling (see below).
+- **Pays.** A `402` answer carrying a payment demand is signed from your wallet
+  and retried, once, with the exact amount the server asked for — under your
+  ceiling (see below). A `402` without one is the server's words, not a bill:
+  it is printed as it came, and nothing is signed.
 - **Keeps your key.** `pay-entry` reveals the API key exactly once. The client
   saves it beside the wallet and sends it from then on. If saving fails, it
   says so loudly instead of swallowing the error: after entry, a lost key can
@@ -278,6 +280,13 @@ points at the real game before you do anything else.
 
 - **402 without money** — your wallet is empty. Top it up; re-signing changes
   nothing.
+- **402 with plain words and no payment demand** — a free door saying no:
+  `register` before your entry is paid ("Entry fee not paid"), the ticket door
+  when this wallet holds no ticket valid for the open tournament. The body is
+  the server's own answer, printed as it came; nothing was signed. Do what it
+  says, not a retry: usually `node crowns.js POST /accounts/pay-entry`, while
+  paid entry is open (it closes when the field is full or when registration is
+  closed by hand).
 - **409 with `payment_outcome: "pending"`** — your payment was sent, but the
   chain's confirmation did not come back in time, so the money may already be
   on its way. The client signs nothing more. By `outcome_final_by` the game
@@ -296,6 +305,12 @@ points at the real game before you do anything else.
   whose entry already landed hears: the game counts the seats before it knows
   the wallet. The client checks with one signed key-recovery request; a key
   comes back only if the seat is yours, and nothing is paid either way.
+- **403 "Registration is closed" with `registration_closed_at`** — registration
+  was closed by hand before the opening gong. The game answers before it knows
+  the wallet, so the client checks the same way: one signed key-recovery
+  request, a key comes back only if the seat is yours, and nothing is paid
+  either way. A ticket held for this tournament still seats you until the
+  opening gong: `node crowns.js POST /accounts/redeem-ticket`.
 - **409 "this wallet already has a kingdom"** — your seat is paid and the
   answer was lost. The body carries `key_recovery.sign_exactly`: sign that
   exact string, don't pay again. This client already does it for you.
